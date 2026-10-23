@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-K线选股规则 v2.3 —— 每周选股（扫描周期 K = 5 个交易日）
+K线选股规则 v2.7 —— 每周选股（扫描周期 K = 5 个交易日）
 
 规则说明见同目录 K线选股规则_v2.md
 v2 的含义 = 加入了「超级成长股基因」的标注工作（见下），选股参数与裁决条件未变。
+v2.6 为 P0 工程修复；v2.7 为 P1-A 候选池上下限调整（CHG_LO 2.0→0.5、CHG_HI 9.5→20.5）。
 
 目录结构：
     /home/kevin/week_select_stocks/
@@ -46,9 +47,10 @@ v2 的含义 = 加入了「超级成长股基因」的标注工作（见下）�
 ⚠️ 修改登记规范（2026-10-15 15:47 起）：
     本程序的每次修改，都必须在 K线选股规则_v2.md 的「十、版本沿革」表中
     登记「修改时间」（精确到分钟）与变更内容。未登记时间的修改视为不合规。
-    最近一次：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
-    上一条　：2026-10-16 11:55（v2.3，据 18 周回测调参：C2 0.5%→1%，基因③ 25%→20%）
-    上上条　：2026-10-16 09:50（v2.1，基因指标补三个前提条件）
+    最近一次：2026-10-23 20:14（v2.7，P1-A：涨幅区间 0.5~20.5，候选池上限/下限调整）
+    上一条　：2026-10-23 19:18（v2.6，P0：K线截断/缓存签名/本地复核/交易日校验/OHLC 落盘）
+    上上条　：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
+    上上上条：2026-10-16 11:55（v2.3，据 18 周回测调参：C2 0.5%→1%，基因③ 25%→20%）
     更早　　：2026-10-16 09:42（v2.0，文档改名 v1→v2，程序内引用同步；逻辑未变）
     　　　　：2026-10-16 09:39（v1.3，新增「超级成长基因」标注列）
     　　　　：2026-10-15 15:49（v1.2，文件头补本条规范）
@@ -57,6 +59,7 @@ v2 的含义 = 加入了「超级成长股基因」的标注工作（见下）�
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -72,7 +75,7 @@ W = os.path.expanduser("~/.local/bin/westock")
 
 # ---------------- 规则参数（见 K线选股规则_v2.md 第三节） ----------------
 K_VOL = 1.75          # ② 启动日放量倍数
-CHG_LO, CHG_HI = 2.0, 9.5     # ③ 当日涨幅区间 %
+CHG_LO, CHG_HI = 0.5, 20.5    # ③ 当日涨幅区间 %（v2.7：原 2.0~9.5）
 FLOW_MIN = 0.2        # ③ 主力净流入 / 流通市值 下限 %
 C3_RATIO = 0.98       # ④ MA20 >= MA60 × 该值
 C2_TOL = 0.01         # ④ MA20 近5日跌幅容忍度（v2.3 由 0.005 放宽；18周实测 0.005 偏紧）
@@ -83,6 +86,17 @@ LABEL_PAGE = 500
 KLINE_LOOKBACK_DAYS = 300   # K线回溯长度（自然日），保证 MA60 与启动日检测有足够历史
 MIN_HISTORY = 70      # find_start 要求基准日 S 的索引 i ≥ 70（即含当日共 ≥71 根）
                       # ⚠️ 补取分支曾只存 1 根，i 恒为 0 → 合格股被误报「K线历史不足(0根)」
+
+# ---------------- 缓存/数据完整性（v2.6，P0） ----------------
+# K 线 bar 的落盘格式（v2.6 起）：
+#   (date, close, volume, open, high, low, amount)
+# 前 3 位与旧版完全一致，旧缓存（3 元组）仍可读；后 4 位旧缓存没有，为 None。
+# 保留前 3 位是为了不重写 116MB 历史缓存，同时让新数据能支持 ATR/收盘位置/成交额。
+BAR_ORDER = "date,close,volume,open,high,low,amount"
+
+# ⚠️ CROSS_TPL 一旦改动，必须同时把 CROSS_CACHE_VERSION +1。
+#    否则旧 cross_*.json 会被当成当前表达式的结果复用（服务端字段随表达式来去）。
+CROSS_CACHE_VERSION = 2
 
 # ---------------- 超级成长基因标注（只标注，不参与任何裁决） ----------------
 # 定位：在已选出的股票后面标注「是否具备超级成长股的基因底子」，
@@ -154,12 +168,17 @@ def md(txt):
     return out
 
 
-def retry(fn, tries=4, base=1.5, what=""):
-    """返回 None 表示彻底失败（调用方必须处理，不得静默继续）"""
+def retry(fn, tries=4, base=1.5, what="", allow_empty=False):
+    """返回 None 表示彻底失败（调用方必须处理，不得静默继续）。
+
+    allow_empty=True 时，空列表/空字符串视为**成功但为空**；只应在
+    「空结果本身合法」的场景使用（如标签分页的下一页）。默认 False，
+    因为历史日期横截面接口会把失败静默表现为空列表。
+    """
     for i in range(tries):
         try:
             r = fn()
-            if r:
+            if r or (allow_empty and r is not None):
                 return r
         except Exception:
             pass
@@ -178,6 +197,24 @@ def fnum(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def to_bar(r):
+    """westock kline 行 → (date, close, volume, open, high, low, amount)。
+
+    ⚠️ 顺序故意把 close/volume 放在第 2/3 位，与 v2.5 及更早的 3 元组缓存兼容；
+    旧缓存没有后 4 位时按 None 处理。新增字段只用于后续的质量过滤，
+    不改变 find_start/judge 的现有口径。
+    """
+    return (r["date"], float(r["last"]), float(r["volume"]),
+            fnum(r.get("open")), fnum(r.get("high")),
+            fnum(r.get("low")), fnum(r.get("amount")))
+
+
+def cross_sig(lo, hi):
+    """横截面缓存签名：表达式 + 参数 + 版本。参数变化 → 缓存自动失效。"""
+    expr = CROSS_TPL.format(lo=lo, hi=hi)
+    return hashlib.sha1(f"v{CROSS_CACHE_VERSION}|{expr}".encode("utf-8")).hexdigest()
 
 
 def cap_to_yuan(v):
@@ -219,17 +256,31 @@ def get_trading_days(end, refresh, span="2026-06-01"):
 
 
 def get_cross(day, lo, hi, refresh):
-    """横截面粗筛，逐日单独落盘"""
+    """横截面粗筛，逐日单独落盘。
+
+    v2.6：缓存带签名（表达式 + lo/hi + 版本）。改 --chg-lo/--chg-hi 或 CROSS_TPL
+    后不会再复用旧结果；旧版无 meta 的缓存仅在「默认参数 + 版本 1」时迁移一次。
+    空结果仍视为失败：历史日期接口会静默返空，不能把失败当成「当天 0 只」。
+    """
     path = os.path.join(DB, f"cross_{day}.json")
+    meta_path = os.path.join(DB, f"cross_{day}.meta.json")
+    sig = cross_sig(lo, hi)
+    expr = CROSS_TPL.format(lo=lo, hi=hi)
     if os.path.exists(path) and not refresh:
-        return jload(path, [])
+        meta = jload(meta_path, {})
+        if meta.get("sig") == sig:
+            return jload(path, [])
+        # v2.7 起默认区间已变（0.5~20.5），旧无 meta 缓存不再迁移，
+        # 一律按新签名重拉，避免把 9.5% 截断池当成新池复用。
+        print(f"      [缓存失效] {day}：参数/表达式已变，重新拉取", flush=True)
     rows = retry(lambda: md(run([W, "screen", "condition", "--expression",
-                                 CROSS_TPL.format(lo=lo, hi=hi),
-                                 "--date", day, "--limit", "6000"])),
+                                 expr, "--date", day, "--limit", "6000"])),
                  what=f"横截面粗筛 {day}")
     if rows is None:
         raise RuntimeError(f"横截面粗筛失败：{day}（不得据此产出名单）")
     jdump(path, rows)
+    jdump(meta_path, {"sig": sig, "version": CROSS_CACHE_VERSION,
+                      "expression": expr})
     time.sleep(0.8)
     return rows
 
@@ -245,7 +296,10 @@ def get_labels(day, refresh):
             rows = retry(lambda: md(run([W, "screen", "label", "--type", L,
                                          "--date", day, "--limit", str(LABEL_PAGE),
                                          "--offset", str(off)])),
-                         what=f"标签 {L} @ {day}")
+                         what=f"标签 {L} @ {day}",
+                         # 第 2 页起，空页是正常的「没有更多」；
+                         # 首屏为空仍判失败——不能把接口故障当成「没有次新股」。
+                         allow_empty=(off > 0))
             if rows is None:
                 # 静默继续会导致次新股漏剔，必须让整次运行失败
                 raise RuntimeError(f"排除集拉取失败：{L} @ {day}")
@@ -260,7 +314,16 @@ def get_labels(day, refresh):
     return out
 
 
-def get_kline(codes, beg, end, refresh):
+def get_kline(codes, beg, end, refresh, require_codes=None):
+    """拉取候选并集的日 K，并保证「基准日有成交的股票」一定有 end 日 K。
+
+    v2.6 P0：
+      · bar 落盘增加 open/high/low/amount（前 3 位兼容旧缓存）；
+      · 批量接口截断（末日≠end）会逐只重取；
+      · require_codes（通常是 cross[end] 的代码）重取后仍缺 end 日 K 时直接报错，
+        不再以「K线无 S 数据」静默剔除。
+    """
+    require_codes = set(require_codes or ())
     span_desc = f"{beg}_{end}"
     path = os.path.join(DB, f"kline_{span_desc}.json")
     km = {} if refresh else jload(path, {})
@@ -277,8 +340,7 @@ def get_kline(codes, beg, end, refresh):
             if not c:
                 continue
             try:
-                km.setdefault(c, []).append(
-                    (r["date"], float(r["last"]), float(r["volume"])))
+                km.setdefault(c, []).append(to_bar(r))
             except (KeyError, ValueError):
                 continue
         for k in km:
@@ -289,6 +351,18 @@ def get_kline(codes, beg, end, refresh):
         time.sleep(0.4)
     if chunks:
         sys.stderr.write("\n")
+
+    def fetch_full(c):
+        """单只拉取完整历史；返回升序 bar 列表或 None。"""
+        rows = retry(lambda: md(run([W, "kline", c, "--start", beg, "--end", end,
+                                     "--limit", "400"])), tries=2, what=f"补取 {c}")
+        if not rows:
+            return None
+        try:
+            out = sorted((to_bar(r) for r in rows), key=lambda b: b[0])
+        except (KeyError, ValueError):
+            return None
+        return out or None
 
     # 批量拉取时单只失败会被静默跳过 —— 逐只补取，避免丢失合格股票
     # ⚠️ 补取必须写入**整段历史**。此处曾误写 `r = rows[0]`，只存 1 根 K 线：
@@ -303,30 +377,62 @@ def get_kline(codes, beg, end, refresh):
         sys.stderr.write(f"  补取缺失的 {len(missing)} 只（第 {rnd+1} 轮）...\n")
         still = []
         for c in missing:
-            rows = retry(lambda: md(run([W, "kline", c, "--start", beg, "--end", end,
-                                         "--limit", "400"])), tries=2, what=f"补取 {c}")
-            if rows:
-                try:
-                    km[c] = sorted(
-                        [(r["date"], float(r["last"]), float(r["volume"])) for r in rows],
-                        key=lambda b: b[0])
-                except (KeyError, ValueError):
-                    still.append(c)
-                else:
-                    if len(km[c]) < MIN_HISTORY:
-                        sys.stderr.write(
-                            f"\n  [警告] {c} 补取仅 {len(km[c])} 根 K 线"
-                            f"（需 ≥{MIN_HISTORY} 根）：若它本应入选，多半是取数不全\n")
+            got = fetch_full(c)
+            if got:
+                km[c] = got
+                if len(km[c]) < MIN_HISTORY:
+                    sys.stderr.write(
+                        f"\n  [警告] {c} 补取仅 {len(km[c])} 根 K 线"
+                        f"（需 ≥{MIN_HISTORY} 根）：若它本应入选，多半是取数不全\n")
             else:
                 still.append(c)
             jdump(path, km)
             time.sleep(0.4)
         if not still:
             break
+
+    # v2.6 P0：批量接口可能「状态 success 但只返回前 400 行」，导致末日远早于 end。
+    # 这类必须重取；重取后仍缺且该股在基准日有成交（require_codes）时直接报错，
+    # 不能把它当成停牌、用「K线无 S 数据」静默剔除。
+    trunc = [c for c in codes if km.get(c) and km[c][-1][0] != end]
+    if trunc:
+        sys.stderr.write(f"\n  校验：{len(trunc)} 只 K 线末日≠{end}，逐只重取 ...\n")
+        for rnd in range(2):
+            still = []
+            for c in trunc:
+                got = fetch_full(c)
+                if got and got[-1][0] == end and len(got) >= len(km.get(c, [])):
+                    km[c] = got
+                else:
+                    still.append(c)
+                jdump(path, km)
+                time.sleep(0.4)
+            trunc = still
+            if not trunc:
+                break
+        if trunc:
+            critical = sorted(set(trunc) & require_codes)
+            if critical:
+                raise RuntimeError(
+                    f"K线截断且重取失败：{critical[:8]}"
+                    f"{'…' if len(critical) > 8 else ''} 在 {end} 有成交，"
+                    f"不能按停牌处理。请加 --refresh 或检查接口。")
+            sys.stderr.write(
+                f"  [警告] {len(trunc)} 只 K 线末日≠{end}（多为停牌），"
+                f"将按「无 {end} 数据」剔除\n")
+
     for k in km:
         km[k].sort(key=lambda b: b[0])
     jdump(path, km)
-    return km, [c for c in codes if c not in km]
+
+    missing = [c for c in codes if c not in km]
+    critical_missing = sorted(set(missing) & require_codes)
+    if critical_missing:
+        raise RuntimeError(
+            f"K线完全缺失：{critical_missing[:8]}"
+            f"{'…' if len(critical_missing) > 8 else ''} 在 {end} 有成交，"
+            f"不能按停牌处理。请加 --refresh 或检查接口。")
+    return km, missing
 
 
 def get_quotes(codes, day, refresh):
@@ -513,7 +619,7 @@ def find_start(code, name, bars, S):
 
 
 def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
-          k_vol, gap, c2, c3):
+          k_vol, gap, c2, c3, chg_lo=CHG_LO, chg_hi=CHG_HI):
     c = det["code"]
     d0 = det["d_star"]
     if det["age"] > N:
@@ -523,6 +629,27 @@ def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
     row0 = cross_by_day.get(d0, {}).get(c)
     if row0 is None:
         return False, f"③ 启动日({d0})未通过日频条件"
+    # v2.6 P0：服务端条件必须在本地复核。否则缓存参数不一致/字段缺失时，
+    # 会静默放进不符合规则的股票（旧版只检查 row0 是否存在）。
+    chg = fnum(row0.get("ChangePCT"))
+    if chg is None:
+        return False, "③ 启动日涨幅字段缺失"
+    if not (chg_lo - 1e-9 <= chg <= chg_hi + 1e-9):
+        return False, f"③ 启动日涨幅{chg:.2f}%不在[{chg_lo},{chg_hi}]"
+    nf = fnum(row0.get("MainNetFlow"))
+    if nf is None:
+        return False, "③ 启动日净流入字段缺失"
+    if nf <= 0:
+        return False, "③ 启动日净流入≤0"
+    nf5 = fnum(row0.get("MainNetFlow5D"))
+    if nf5 is None:
+        return False, "③ 5日净流入字段缺失"
+    if nf5 <= 0:
+        return False, "③ 5日净流入≤0"
+    for flag in ("IsDelisted", "Ifsuspend"):
+        v = fnum(row0.get(flag))
+        if v is not None and v != 0:
+            return False, f"③ 启动日 {flag}≠0"
     if det["m20s"] is None or det["m60s"] is None:
         return False, "④ 启动日无均线数据"
     if det["m20s"] < det["m60s"] * c3:
@@ -547,7 +674,7 @@ def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
 # ---------------- 主流程 ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="K线选股规则 v1（每周选股，K=5）")
+    ap = argparse.ArgumentParser(description="K线选股规则 v2.7（每周选股，K=5）")
     ap.add_argument("--date", help="基准交易日（默认最近交易日）")
     ap.add_argument("--n", type=int, default=4,
                     help="新鲜度窗口，必须 = 扫描周期−1（每周 K=5 用 4=默认；"
@@ -574,6 +701,14 @@ def main():
         print("错误：交易日历为空", file=sys.stderr)
         return 1
     S = a.date or days[-1]
+    if S not in days:
+        prev = max((d for d in days if d <= S), default=None)
+        print(f"错误：基准日 {S} 不是交易日；最近交易日为 {prev or '无'}",
+              file=sys.stderr)
+        return 1
+    if a.chg_lo > a.chg_hi:
+        print(f"错误：--chg-lo {a.chg_lo} > --chg-hi {a.chg_hi}", file=sys.stderr)
+        return 1
     hist = [d for d in days if d <= S]
     if len(hist) < a.n + 1:
         print(f"错误：基准日 {S} 之前交易日不足（需要 {a.n+1} 天）", file=sys.stderr)
@@ -590,6 +725,21 @@ def main():
         cross_by_day[d] = {r["code"]: r for r in rows if r.get("code")}
         print(f"      {d}: {len(cross_by_day[d])} 只")
 
+    # v2.6 P0：字段缺失必须在裁决前报错。服务端只返回表达式引用到的列，
+    # 若 CROSS_TPL 改动或旧缓存缺列，judge 的本地复核会全部失败，
+    # 看起来像「没有合格股」，实际是数据问题。
+    bad_fields = []
+    for d in need:
+        for c, r in cross_by_day[d].items():
+            for k in ("ChangePCT", "MainNetFlow", "MainNetFlow5D"):
+                if fnum(r.get(k)) is None:
+                    bad_fields.append((d, c, k))
+    if bad_fields:
+        d, c, k = bad_fields[0]
+        raise RuntimeError(
+            f"横截面字段缺失 {len(bad_fields)} 处（如 {d} {c} {k}）。"
+            f"请检查 CROSS_TPL 是否仍引用这些字段，或加 --refresh 重建缓存。")
+
     print("[3/6] 排除集（ST + 次新分桶）...", flush=True)
     st_by_day, new_by_day = {}, {}
     for d in need:
@@ -603,10 +753,17 @@ def main():
     print(f"[4/6] 日K线：候选并集 {len(pool)} 只 ...", flush=True)
     kbeg = (dt.date.fromisoformat(need[0])
             - dt.timedelta(days=KLINE_LOOKBACK_DAYS)).isoformat()
-    km, km_missing = get_kline(pool, kbeg, S, a.refresh)
+    km, km_missing = get_kline(pool, kbeg, S, a.refresh,
+                               require_codes=set(cross_by_day[S]))
     hit_cnt = sum(1 for c in pool if km.get(c))
     print(f"      命中 {hit_cnt}/{len(pool)}")
     if km_missing:
+        critical = sorted(set(km_missing) & set(cross_by_day[S]))
+        if critical:
+            raise RuntimeError(
+                f"基准日有成交但完全取不到 K 线：{critical[:8]}"
+                f"{'…' if len(critical) > 8 else ''}。"
+                f"不能按停牌处理，请加 --refresh 或检查接口。")
         print(f"      ⚠️ {len(km_missing)} 只取不到K线，将按「无K线数据」剔除："
               f"{', '.join(km_missing[:8])}{'…' if len(km_missing) > 8 else ''}")
 
@@ -620,7 +777,8 @@ def main():
             rej[why0] = rej.get(why0, 0) + 1
             continue
         ok, why = judge(det, km[c], S, a.n, cross_by_day, st_by_day, new_by_day,
-                        a.k_vol, a.ma60_gap, C2_TOL, C3_RATIO)
+                        a.k_vol, a.ma60_gap, C2_TOL, C3_RATIO,
+                        a.chg_lo, a.chg_hi)
         if ok:
             hit.append(det)
         else:

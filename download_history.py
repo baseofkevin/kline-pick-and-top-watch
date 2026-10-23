@@ -150,7 +150,11 @@ def download_cross(days, refresh):
     _TOTAL[0] += len(days)
     for d in days:
         path = os.path.join(DB, f"cross_{d}.json")
-        if os.path.exists(path) and not refresh:
+        meta_path = os.path.join(DB, f"cross_{d}.meta.json")
+        sig = RULE.cross_sig(lo, hi)
+        meta = jload(meta_path, {})
+        if (os.path.exists(path) and not refresh
+                and meta.get("sig") == sig):
             tick(f"粗筛 {d} (已有)")
             continue
         rows = retry(lambda: md(run([W, "screen", "condition", "--expression", expr,
@@ -159,6 +163,11 @@ def download_cross(days, refresh):
         if rows is None:
             raise RuntimeError(f"横截面粗筛失败：{d}（不得留下残缺数据）")
         jdump(path, rows)
+        # v2.7：与 screen_kline.py 的缓存签名保持一致，避免下载脚本写数据、
+        # 选股脚本却因 meta 缺失/过期而重拉。
+        jdump(meta_path, {"sig": sig,
+                          "version": RULE.CROSS_CACHE_VERSION,
+                          "expression": expr})
         tick(f"粗筛 {d} ({len(rows)}只)")
         time.sleep(SLEEP)
 
@@ -230,7 +239,7 @@ def _fetch_one(code, beg, end):
     out = []
     for r in rows:
         try:
-            out.append((r["date"], float(r["last"]), float(r["volume"])))
+            out.append(RULE.to_bar(r))
         except (KeyError, ValueError):
             continue
     return sorted(out, key=lambda b: b[0]) if out else None
@@ -260,8 +269,7 @@ def download_kline(codes, beg, end, refresh, batch=KLINE_BATCH, flush_every=10):
                 if not c:
                     continue
                 try:
-                    km.setdefault(c, []).append(
-                        (r["date"], float(r["last"]), float(r["volume"])))
+                    km.setdefault(c, []).append(RULE.to_bar(r))
                     touched.add(c)
                 except (KeyError, ValueError):
                     continue
