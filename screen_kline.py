@@ -46,10 +46,11 @@ v2 的含义 = 加入了「超级成长股基因」的标注工作（见下）�
 ⚠️ 修改登记规范（2026-10-15 15:47 起）：
     本程序的每次修改，都必须在 K线选股规则_v2.md 的「十、版本沿革」表中
     登记「修改时间」（精确到分钟）与变更内容。未登记时间的修改视为不合规。
-    最近一次：2026-10-16 11:55（v2.3，据 18 周回测调参：C2 0.5%→1%，基因③ 25%→20%）
-    上一条　：2026-10-16 09:50（v2.1，基因指标补三个前提条件）
-    上上条　：2026-10-16 09:42（v2.0，文档改名 v1→v2，程序内引用同步；逻辑未变）
-    更早　　：2026-10-16 09:39（v1.3，新增「超级成长基因」标注列）
+    最近一次：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
+    上一条　：2026-10-16 11:55（v2.3，据 18 周回测调参：C2 0.5%→1%，基因③ 25%→20%）
+    上上条　：2026-10-16 09:50（v2.1，基因指标补三个前提条件）
+    更早　　：2026-10-16 09:42（v2.0，文档改名 v1→v2，程序内引用同步；逻辑未变）
+    　　　　：2026-10-16 09:39（v1.3，新增「超级成长基因」标注列）
     　　　　：2026-10-15 15:49（v1.2，文件头补本条规范）
     　　　　：2026-10-15 15:38（v1.1，补 nf is None 防线 + CROSS_TPL 注释）
 """
@@ -80,6 +81,8 @@ LISTED_YEARS = 3      # ⑤ 上市满 N 年
 KLINE_BATCH = 20      # westock kline 单批上限
 LABEL_PAGE = 500
 KLINE_LOOKBACK_DAYS = 300   # K线回溯长度（自然日），保证 MA60 与启动日检测有足够历史
+MIN_HISTORY = 70      # find_start 要求基准日 S 的索引 i ≥ 70（即含当日共 ≥71 根）
+                      # ⚠️ 补取分支曾只存 1 根，i 恒为 0 → 合格股被误报「K线历史不足(0根)」
 
 # ---------------- 超级成长基因标注（只标注，不参与任何裁决） ----------------
 # 定位：在已选出的股票后面标注「是否具备超级成长股的基因底子」，
@@ -288,6 +291,11 @@ def get_kline(codes, beg, end, refresh):
         sys.stderr.write("\n")
 
     # 批量拉取时单只失败会被静默跳过 —— 逐只补取，避免丢失合格股票
+    # ⚠️ 补取必须写入**整段历史**。此处曾误写 `r = rows[0]`，只存 1 根 K 线：
+    #    单只接口按日期倒序返回，rows[0] 恰是基准日那根，于是 find_start 的
+    #    i 恒为 0、命中 i<MIN_HISTORY，报「K线历史不足(0根)」——与真次新股的
+    #    文案完全相同，且坏结果已被 jdump 写进 kline_*.json（同日重跑不再重取、
+    #    补取第二轮也不再视其为 missing），合格股会被永久性地静默剔除。
     for rnd in range(2):
         missing = [c for c in codes if c not in km]
         if not missing:
@@ -298,12 +306,17 @@ def get_kline(codes, beg, end, refresh):
             rows = retry(lambda: md(run([W, "kline", c, "--start", beg, "--end", end,
                                          "--limit", "400"])), tries=2, what=f"补取 {c}")
             if rows:
-                r = rows[0]
                 try:
-                    km[c] = sorted([(r["date"], float(r["last"]), float(r["volume"]))],
-                                   key=lambda b: b[0])
+                    km[c] = sorted(
+                        [(r["date"], float(r["last"]), float(r["volume"])) for r in rows],
+                        key=lambda b: b[0])
                 except (KeyError, ValueError):
                     still.append(c)
+                else:
+                    if len(km[c]) < MIN_HISTORY:
+                        sys.stderr.write(
+                            f"\n  [警告] {c} 补取仅 {len(km[c])} 根 K 线"
+                            f"（需 ≥{MIN_HISTORY} 根）：若它本应入选，多半是取数不全\n")
             else:
                 still.append(c)
             jdump(path, km)
@@ -477,7 +490,7 @@ def find_start(code, name, bars, S):
     i = next((j for j, x in enumerate(bars) if x[0] == S), None)
     if i is None:
         return None, f"K线无 {S} 数据"
-    if i < 70:
+    if i < MIN_HISTORY:
         return None, f"K线历史不足({i}根)"
     cl = [x[1] for x in bars]
     vo = [x[2] for x in bars]
