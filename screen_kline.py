@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-K线选股规则 v2.7 —— 每周选股（扫描周期 K = 5 个交易日）
+K线选股规则 v2.8 —— 每周选股（扫描周期 K = 5 个交易日）
 
 规则说明见同目录 K线选股规则_v2.md
 v2 的含义 = 加入了「超级成长股基因」的标注工作（见下），选股参数与裁决条件未变。
-v2.6 为 P0 工程修复；v2.7 为 P1-A 候选池上下限调整（CHG_LO 2.0→0.5、CHG_HI 9.5→20.5）。
+v2.6 为 P0 工程修复；v2.7 为 P1-A 候选池上下限调整（CHG_LO 2.0→0.5、CHG_HI 9.5→20.5）；
+v2.8 把第九节基因口径整体替换为「单季EPS同比 / 三年EPS CAGR / 年报ROE」。
 
 目录结构：
     /home/kevin/week_select_stocks/
@@ -16,8 +17,7 @@ v2.6 为 P0 工程修复；v2.7 为 P1-A 候选池上下限调整（CHG_LO 2.0�
     │   ├── labels_<起>_<止>.json    排除集原始返回（ST + 次新分桶）
     │   ├── kline_<起>_<止>.json     候选并集的日K线原始数据
     │   ├── quote_<基准日>.json      最终名单的行情快照
-    │   ├── gene_snapshot_<基准日>.json  基因标注用的全市场快照
-    │   ├── gene_industry_map.json   申万二级行业 → 个股映射（长期缓存）
+    │   ├── finance_<基准日>.json    基因标注用的候选股财务历史（利润表）
     │   └── result_<基准日>.json     本次运行结果与逐条剔除明细（便于追溯）
     └── csv/
         └── 选股_<基准日>.csv         按规则选出的股票
@@ -30,28 +30,32 @@ v2.6 为 P0 工程修复；v2.7 为 P1-A 候选池上下限调整（CHG_LO 2.0�
 
 退出码：0 正常 ｜ 1 出错（含原始数据下载失败）
 
-超级成长基因标注（v2，即规则文档第九节）：
+超级成长基因标注（v2.8，即规则文档第九节）：
     在已选出的股票后面加一列「超级成长基因」（是/否/无数据），仅作标注，
-    **不筛选、不排序、不影响入选名单**。下列条件全部成立才算「是」：
-      ① 弹性系数   归母净利同比% ÷ 营收同比%      > 1
-         前提：归母净利 > 0（亏损时"同比"符号无意义）
-         前提：营收同比 ≥ 5%（分母趋零时比率会把噪声放大成信号）
-      ② 固定资产占比 (固定资产 + 在建工程)/总资产   > 20%
-      ③ 行业扩产强度 Σ行业在建工程 ÷ Σ行业固定资产  < 20%
-         前提：行业营收增速 > 0（萎缩行业里的低扩产不是瓶颈，是价值陷阱）
-    ⚠️ ①的"归母净利>0"与③的"行业营收>0"不是额外筛选，而是指标本身有意义的前提。
-       首版漏掉它们，实测把亏损的长春燃气、营收仅+1.12%的新世界误标为「是」。
-    基因数据获取失败时该列留空（不标「否」），并在 stderr 给出告警——
-    选股结果不受影响，但不得把「失败」误读成「已确认没有基因」。
+    **不筛选、不排序、不影响入选名单**。下列三条同时成立才算「是」：
+      ① 最新单季 EPS 同比增长率 > 40%
+      ② 过去三年 EPS 年均复合增长率 > 25%
+      ③ 最新年报 ROE > 17%
+    口径：
+      · 单季 EPS 由同期累计基本 EPS 差分得到：
+        Q1=一季报；Q2=半年报−一季报；Q3=三季报−半年报；Q4=年报−三季报。
+        同比基期单季 EPS 必须 > 0，否则「同比」没有意义，判「否」。
+      · 三年 CAGR = (最近年报 EPS ÷ 三年前年报 EPS)^(1/3) − 1，
+        两期 EPS 均须 > 0；最近年报为 Y，基期为 Y−3。
+      · ROE 取最新年报加权 ROE（ROEWeighted，缺失时回退 ROE）。
+      · 只认基准日已披露的报告期（InfoPublDate ≤ 基准日），避免未来函数。
+    财务数据获取失败时该列留空（不标「否」），并在 stderr 给出告警；
+    单只股票无财务数据时标「无数据」。二者都不得误读成「已确认没有基因」。
 
 ⚠️ 修改登记规范（2026-10-15 15:47 起）：
     本程序的每次修改，都必须在 K线选股规则_v2.md 的「十、版本沿革」表中
     登记「修改时间」（精确到分钟）与变更内容。未登记时间的修改视为不合规。
-    最近一次：2026-10-23 20:14（v2.7，P1-A：涨幅区间 0.5~20.5，候选池上限/下限调整）
-    上一条　：2026-10-23 19:18（v2.6，P0：K线截断/缓存签名/本地复核/交易日校验/OHLC 落盘）
-    上上条　：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
-    上上上条：2026-10-16 11:55（v2.3，据 18 周回测调参：C2 0.5%→1%，基因③ 25%→20%）
-    更早　　：2026-10-16 09:42（v2.0，文档改名 v1→v2，程序内引用同步；逻辑未变）
+    最近一次：2026-10-25 10:08（v2.8，第九节基因改为 EPS 单季同比/三年 CAGR/年报 ROE）
+    上一条　：2026-10-23 20:14（v2.7，P1-A：涨幅区间 0.5~20.5，候选池上限/下限调整）
+    上上条　：2026-10-23 19:18（v2.6，P0：K线截断/缓存签名/本地复核/交易日校验/OHLC 落盘）
+    上上上条：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
+    更早　　：2026-10-16 11:55（v2.3，据 18 周回测调参：C2 0.5%→1%，基因③ 25%→20%）
+    　　　　：2026-10-16 09:42（v2.0，文档改名 v1→v2，程序内引用同步；逻辑未变）
     　　　　：2026-10-16 09:39（v1.3，新增「超级成长基因」标注列）
     　　　　：2026-10-15 15:49（v1.2，文件头补本条规范）
     　　　　：2026-10-15 15:38（v1.1，补 nf is None 防线 + CROSS_TPL 注释）
@@ -98,34 +102,19 @@ BAR_ORDER = "date,close,volume,open,high,low,amount"
 #    否则旧 cross_*.json 会被当成当前表达式的结果复用（服务端字段随表达式来去）。
 CROSS_CACHE_VERSION = 2
 
-# ---------------- 超级成长基因标注（只标注，不参与任何裁决） ----------------
+# ---------------- 成长基因标注（只标注，不参与任何裁决） ----------------
 # 定位：在已选出的股票后面标注「是否具备超级成长股的基因底子」，
 #       供人工精筛参考。**它不筛选、不排序、不影响入选名单**。
-# 三个指标来自「周期躯壳 × 成长内核」框架，实测中区分度最高的三条：
-#   ① 弹性系数   归母净利同比% ÷ 营收同比%        —— 经营杠杆是否在兑现
-#   ② 固定资产占比 (固定资产 + 在建工程) / 总资产  —— 是否具备经营杠杆的物理基础
-#   ③ 行业扩产强度 Σ行业在建工程 ÷ Σ行业固定资产   —— 行业供给是否在填平瓶颈（越低越好）
-GENE_ELASTIC_MIN = 1.0      # ① 下限：利润增速必须快于营收增速
-GENE_REV_GROWTH_MIN = 5.0   # ① 定义域下限：营收同比太小时弹性系数是噪声放大
-                            #    （实测反例：新世界营收 +1.12%、利润 +4.2% → 弹性 3.78，
-                            #      但两个增速都是噪声，且它是一家百货公司）
-GENE_FA_MIN = 0.20          # ② 下限
-GENE_IND_SUPPLY_MAX = 20.0  # ③ 上限（%）：行业在疯狂扩产则瓶颈将被填平
-                            #    v2.3 由 25% 收紧为 20%。18周实测：放宽到 40% 命中只多 19%，
-                            #    说明 25% 几乎不约束；20% 才真正剔除明显过剩的行业
-GENE_IND_REV_GROWTH_MIN = 0.0  # ③ 前提：行业营收必须正增长。否则「低扩产强度」不是供给
-                               #    瓶颈而是价值陷阱——没人愿意投资的衰退行业
-                               #    （实测反例：长春燃气所在燃气Ⅱ行业营收 −5.05%）
-GENE_BATCH = 12             # sector constituent 单批行业数
-GENE_MIN_IND_N = 5          # 行业成员少于此数不做行业聚合（样本太小）
-
-# 基因快照分两批拉取：条件引擎对 null 字段（如「没有在建工程」）一律判假，
-# 若把 TConstruInProcess 写进同一个表达式，会把 600+ 只静默丢掉。
-# 因此单独拉一批，缺失即视为 0（null = 没有在建工程，不是「未知」）。
-GENE_TPL_A = ("intersect([TotalAssets > 0, OperatingRevenue > 0, TotalFixedAsset >= 0, "
-              "NPParentCompanyOwners > -1e15, OperatingRevenueGrowRate > -1e15, "
-              "NPParentCompanyYOY > -1e15])")
-GENE_TPL_B = ("intersect([TotalAssets > 0, OperatingRevenue > 0, TConstruInProcess >= 0])")
+# 三条同时成立才标「是」：
+#   ① 最新单季 EPS 同比增长率 > 40%
+#   ② 过去三年 EPS 年均复合增长率 > 25%
+#   ③ 最新年报 ROE > 17%
+GENE_EPS_Q_YOY_MIN = 40.0    # ① 单季 EPS 同比下限（%）
+GENE_EPS_CAGR3_MIN = 25.0    # ② 三年 EPS CAGR 下限（%）
+GENE_ROE_MIN = 17.0          # ③ 最新年报 ROE 下限（%）
+GENE_EPS_CAGR_YEARS = 3      # ② 复合增长年数：最近年报 Y 对比 Y−3
+GENE_FIN_PERIODS = 20        # data_finance 拉取期数（5 年，够算 3 年 CAGR）
+GENE_FIN_BATCH = 10          # data_finance 单批股票数
 
 # ⚠️ 表达式里的 `MainNetFlow > 0` 有两个作用，**不可删除**：
 #    ① 作为筛选条件，它确实被「净流入 ÷ 流通市值 ≥ 下限」蕴含（流通市值恒正）；
@@ -460,131 +449,179 @@ def get_quotes(codes, day, refresh):
     return out
 
 
-# ---------------- 超级成长基因标注（独立于上面的裁决） ----------------
+# ---------------- 成长基因标注（独立于上面的裁决） ----------------
 
-def get_industry_map(refresh):
-    """申万二级行业 → 个股映射。长期缓存（行业归属变化很慢），--refresh 强制更新。
-    失败返回 None（调用方负责提示，不得静默当作「没有基因」）。"""
-    path = os.path.join(DB, "gene_industry_map.json")
-    if os.path.exists(path) and not refresh:
-        m = jload(path, {})
-        if m:
-            return m
-    rows = retry(lambda: md(run([W, "sector", "ranking"])), what="申万行业清单")
-    if not rows:
-        return None
-    codes = [r["code"] for r in rows
-             if r.get("code", "").startswith("pt0") and r.get("name")]
+def _westock_module():
+    """把 westock CLI 当模块加载，复用它已有的鉴权 / JSON-RPC。
+
+    westock CLI 目前没有 finance 子命令，而 data_finance 是拿财务历史的唯一入口。
+    这里不复制令牌与续期逻辑，避免两套认证代码各自过期。
+    """
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("westock_cli", W)
+    spec = importlib.util.spec_from_loader("westock_cli", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    if not hasattr(mod, "call"):
+        raise RuntimeError("当前 westock CLI 不支持 data_finance 的模块调用")
+    return mod
+
+
+def get_finance(codes, day, refresh):
+    """拉取候选股的利润表核心字段，按基准日缓存。
+
+    返回 ({code: [rows]}, 失败代码列表)。rows 是 data_finance 的原始报告期记录，
+    含 BasicEPS / ROE / ROEWeighted / EndDate / InfoPublDate。
+    """
+    path = os.path.join(DB, f"finance_{day}.json")
+    cached = {} if refresh else jload(path, {})
+    todo = [c for c in codes if c not in cached]
+    failed = []
+    if not todo:
+        return cached, failed
+    try:
+        wk = _westock_module()
+    except Exception as e:
+        sys.stderr.write(f"  [失败] 加载 westock 模块：{e}\n")
+        return cached, list(codes)
+    for i in range(0, len(todo), GENE_FIN_BATCH):
+        ch = todo[i:i + GENE_FIN_BATCH]
+        d = retry(lambda: wk.call("data_finance", {
+            "codes": ",".join(ch), "fields": "core",
+            "num": GENE_FIN_PERIODS, "type": "income"}),
+            what=f"财务数据 第{i // GENE_FIN_BATCH + 1}批")
+        if d is None:
+            failed.extend(ch)
+            continue
+        data = d.get("data") if isinstance(d, dict) else None
+        if not isinstance(data, dict):
+            failed.extend(ch)
+            continue
+        for c in ch:
+            rows = data.get(c)
+            if rows:
+                cached[c] = rows
+            else:
+                failed.append(c)
+        jdump(path, cached)
+        time.sleep(0.4)
+    return cached, failed
+
+
+def _pub_date(v):
+    """InfoPublDate 形如 '2026-08-15 00:00:00 +0800 CST' → '2026-08-15'。"""
+    return str(v)[:10] if v else None
+
+
+def _diff(a, b):
+    return a - b if a is not None and b is not None else None
+
+
+def gene_metrics(rows, day):
+    """按基准日已披露的报告期，计算三条基因指标。
+
+    ⚠️ 必须按 InfoPublDate ≤ day 过滤：data_finance 返回的是「今天能看到的全部
+    报告期」，若不做点位过滤，回测历史日期时会用上当时尚未披露的财报。
+    """
+    rows = [r for r in rows
+            if _pub_date(r.get("InfoPublDate")) and _pub_date(r.get("EndDate"))
+            and _pub_date(r.get("InfoPublDate")) <= day]
+    by = {_pub_date(r["EndDate"]): r for r in rows}
+    if not by:
+        return None      # 基准日前没有已披露财报 → 调用方标「无数据」
+
+    latest = max(by)
+    y, m = int(latest[:4]), int(latest[5:7])
+
+    def cum(dt):
+        r = by.get(dt)
+        return fnum(r.get("BasicEPS")) if r else None
+
+    # 单季 EPS = 本期累计 − 上一期累计；Q1 本身就是单季
+    if m == 3:
+        cur_q, prev_q = cum(latest), cum(f"{y-1}-03-31")
+    elif m == 6:
+        cur_q = _diff(cum(latest), cum(f"{y}-03-31"))
+        prev_q = _diff(cum(f"{y-1}-06-30"), cum(f"{y-1}-03-31"))
+    elif m == 9:
+        cur_q = _diff(cum(latest), cum(f"{y}-06-30"))
+        prev_q = _diff(cum(f"{y-1}-09-30"), cum(f"{y-1}-06-30"))
+    elif m == 12:
+        cur_q = _diff(cum(latest), cum(f"{y}-09-30"))
+        prev_q = _diff(cum(f"{y-1}-12-31"), cum(f"{y-1}-09-30"))
+    else:
+        cur_q = prev_q = None
+
+    eps_yoy = None
+    if cur_q is not None and prev_q is not None and prev_q > 0:
+        eps_yoy = (cur_q / prev_q - 1) * 100
+
+    # 年报序列：最近年报 Y 与 Y−3 的 EPS 算三年 CAGR
+    annuals = sorted(
+        ((int(dt[:4]), fnum(r.get("BasicEPS")),
+          fnum(r.get("ROEWeighted")), fnum(r.get("ROE")))
+         for dt, r in by.items() if dt.endswith("-12-31")),
+        reverse=True)
+    roe = None
+    annual_y = eps_annual = base_y = eps_base = cagr = None
+    if annuals:
+        annual_y, eps_annual, roe_w, roe_raw = annuals[0]
+        roe = roe_w if roe_w is not None else roe_raw
+        base_y = annual_y - GENE_EPS_CAGR_YEARS
+        base = next((x for x in annuals if x[0] == base_y), None)
+        if base:
+            eps_base = base[1]
+            if eps_annual is not None and eps_base is not None \
+                    and eps_annual > 0 and eps_base > 0:
+                cagr = ((eps_annual / eps_base) ** (1.0 / GENE_EPS_CAGR_YEARS) - 1) * 100
+
+    reasons = []
+    if eps_yoy is None:
+        reasons.append("单季EPS同比不可用（基期EPS≤0或数据缺失）")
+    elif eps_yoy <= GENE_EPS_Q_YOY_MIN:
+        reasons.append(f"单季EPS同比 {eps_yoy:.2f}% ≤ {GENE_EPS_Q_YOY_MIN:g}%")
+    if cagr is None:
+        reasons.append("三年EPS CAGR不可用（两期EPS须>0）")
+    elif cagr <= GENE_EPS_CAGR3_MIN:
+        reasons.append(f"三年EPS CAGR {cagr:.2f}% ≤ {GENE_EPS_CAGR3_MIN:g}%")
+    if roe is None:
+        reasons.append("最新年报ROE缺失")
+    elif roe <= GENE_ROE_MIN:
+        reasons.append(f"最新年报ROE {roe:.2f}% ≤ {GENE_ROE_MIN:g}%")
+
+    return {"gene": not reasons,
+            "reason": "；".join(reasons) if reasons else "",
+            "latest_report": latest,
+            "eps_q": round(cur_q, 4) if cur_q is not None else None,
+            "eps_q_prev": round(prev_q, 4) if prev_q is not None else None,
+            "eps_q_yoy": round(eps_yoy, 2) if eps_yoy is not None else None,
+            "annual_y": annual_y, "eps_annual": eps_annual,
+            "base_y": base_y, "eps_base": eps_base,
+            "eps_cagr3": round(cagr, 2) if cagr is not None else None,
+            "roe": round(roe, 2) if roe is not None else None}
+
+
+def compute_gene(codes, day, refresh):
+    """返回 ({code: metrics}, 失败代码列表)；全部失败返回 (None, codes)。
+
+    单只股票没有财务数据不算「整体失败」：该股标「无数据」，不影响其他股票。
+    """
     if not codes:
-        return None
-    mapping = {}
-    for i in range(0, len(codes), GENE_BATCH):
-        ch = codes[i:i + GENE_BATCH]
-        txt = retry(lambda: run([W, "sector", "constituent", ",".join(ch),
-                                 "--limit", "0"]),
-                    what=f"行业成分股 第{i // GENE_BATCH + 1}批")
-        if txt is None:
-            return None
-        cur = None
-        for ln in txt.splitlines():
-            s = ln.strip()
-            if "成分股-" in s and "[" in s:
-                cur = s.split("成分股-", 1)[1].split("[", 1)[0].strip()
-            if not s.startswith("|"):
-                continue
-            c = [x.strip() for x in s.strip("|").split("|")]
-            if len(c) < 2 or c[0] in ("code", "") or all(set(v) <= set("-: ") for v in c):
-                continue
-            if cur and c[0][:2] in ("sh", "sz", "bj"):
-                mapping[c[0]] = cur
-        time.sleep(0.3)
-    if not mapping:
-        return None
-    jdump(path, mapping)
-    return mapping
-
-
-def get_gene_snapshot(day, refresh):
-    """全市场基因原始数据（按基准日缓存）。失败返回 None。"""
-    path = os.path.join(DB, f"gene_snapshot_{day}.json")
-    if os.path.exists(path) and not refresh:
-        cached = jload(path, None)
-        if cached:
-            return cached
-    ra = retry(lambda: md(run([W, "screen", "condition", "--expression", GENE_TPL_A,
-                               "--date", day, "--limit", "8000"])),
-               what=f"基因快照A {day}")
-    if not ra:
-        return None
-    rb = retry(lambda: md(run([W, "screen", "condition", "--expression", GENE_TPL_B,
-                               "--date", day, "--limit", "8000"])),
-               what=f"基因快照B {day}")
-    if not rb:
-        return None
-    out = {"a": ra,
-           "b": {r["code"]: r.get("TConstruInProcess") for r in rb if r.get("code")}}
-    jdump(path, out)
-    return out
-
-
-def compute_gene(day, refresh):
-    """返回 {code: {elastic, fa_ratio, ind_supply, gene, ...}}；失败返回 None。"""
-    snap = get_gene_snapshot(day, refresh)
-    if snap is None:
-        return None
-    imap = get_industry_map(refresh)
-    if imap is None:
-        return None
+        return {}, []
+    rows_by, failed = get_finance(codes, day, refresh)
+    if not rows_by:
+        return None, failed
     info = {}
-    for r in snap["a"]:
-        c = r.get("code")
-        if not c:
+    for c in codes:
+        rows = rows_by.get(c)
+        if not rows:
             continue
-        ta = fnum(r.get("TotalAssets"))
-        fa = fnum(r.get("TotalFixedAsset"))
-        rg = fnum(r.get("OperatingRevenueGrowRate"))
-        pg = fnum(r.get("NPParentCompanyYOY"))
-        rev = fnum(r.get("OperatingRevenue"))
-        np_ = fnum(r.get("NPParentCompanyOwners"))
-        if None in (ta, fa, rg, pg, rev, np_) or ta <= 0 or rev <= 0:
-            continue
-        cip = fnum(snap["b"].get(c))
-        if cip is None:
-            cip = 0.0        # ⚠️ null = 没有在建工程，不是「未知」
-        info[c] = {"name": r.get("name"),
-                   "ind": imap.get(c, "未分类"),
-                   "rev": rev, "np": np_, "rg": rg, "pg": pg,
-                   "fa_ratio": (fa + cip) / ta,
-                   "elastic": (pg / rg) if rg > 0 else None,
-                   "cip": cip, "fa": fa}
-    # ③ 行业聚合：扩产强度 = Σ在建 ÷ Σ固资；行业营收增速 = 营收加权
-    agg = {}
-    for c, v in info.items():
-        g = agg.setdefault(v["ind"], [0.0, 0.0, 0, 0.0, 0.0])
-        g[0] += v["cip"]
-        g[1] += v["fa"]
-        g[2] += 1
-        g[3] += v["rev"] * v["rg"]
-        g[4] += v["rev"]
-    supply, ind_rg = {}, {}
-    for k, v in agg.items():
-        ok = v[2] >= GENE_MIN_IND_N
-        supply[k] = (v[0] / v[1] * 100.0) if (ok and v[1] > 0) else None
-        ind_rg[k] = (v[3] / v[4]) if (ok and v[4] > 0) else None
-    for v in info.values():
-        v["ind_supply"] = supply.get(v["ind"])
-        v["ind_rev_growth"] = ind_rg.get(v["ind"])
-        v["gene"] = bool(
-            v["np"] > 0                              # ① 必须盈利：亏损时「同比」的符号无意义
-            and v["elastic"] is not None
-            and v["elastic"] > GENE_ELASTIC_MIN
-            and v["rg"] >= GENE_REV_GROWTH_MIN       # ① 分母不能太小，否则比值是噪声放大
-            and v["fa_ratio"] > GENE_FA_MIN          # ②
-            and v["ind_supply"] is not None
-            and v["ind_supply"] < GENE_IND_SUPPLY_MAX    # ③
-            and v["ind_rev_growth"] is not None
-            and v["ind_rev_growth"] > GENE_IND_REV_GROWTH_MIN)  # ③ 前提：行业须在扩张
-    return info
+        g = gene_metrics(rows, day)
+        if g is None:
+            continue      # 只有基准日之后的财报 → 「无数据」，不是「否」
+        info[c] = g
+    return info, failed
 
 
 # ---------------- 裁决 ----------------
@@ -674,7 +711,7 @@ def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
 # ---------------- 主流程 ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="K线选股规则 v2.7（每周选股，K=5）")
+    ap = argparse.ArgumentParser(description="K线选股规则 v2.8（每周选股，K=5）")
     ap.add_argument("--date", help="基准交易日（默认最近交易日）")
     ap.add_argument("--n", type=int, default=4,
                     help="新鲜度窗口，必须 = 扫描周期−1（每周 K=5 用 4=默认；"
@@ -843,11 +880,15 @@ def main():
         rej[k] = rej.get(k, 0) + v
 
     # ---- 超级成长基因标注（只标注，不影响上面任何裁决结果）----
-    gene = compute_gene(S, a.refresh)
+    gene, gene_failed = compute_gene([x["code"] for x in final], S, a.refresh)
     if gene is None:
-        # 基因数据是**附加标注**，不该因为它失败就让整周选股作废；
+        # 财务数据是**附加标注**，不该因为它失败就让整周选股作废；
         # 但也绝不能静默标成「否」——那会被误读为「已确认没有基因」。
-        print("      ⚠️ 基因快照获取失败：「超级成长基因」列留空（选股结果不受影响）",
+        print("      ⚠️ 财务数据获取失败：「超级成长基因」列留空（选股结果不受影响）",
+              file=sys.stderr)
+    elif gene_failed:
+        print(f"      ⚠️ {len(gene_failed)} 只财务数据缺失，标「无数据」："
+              f"{', '.join(gene_failed[:8])}{'…' if len(gene_failed) > 8 else ''}",
               file=sys.stderr)
     for x in final:
         if gene is None:
@@ -890,10 +931,12 @@ def main():
                        "市值比下限": a.flow_ratio, "MA60上限": a.ma60_gap,
                        "C2容忍": C2_TOL, "C3比例": C3_RATIO,
                        "上市满年数": LISTED_YEARS},
-              "基因标注参数": {"弹性系数下限": GENE_ELASTIC_MIN,
-                               "固定资产占比下限": GENE_FA_MIN,
-                               "行业扩产强度上限": GENE_IND_SUPPLY_MAX,
-                               "数据是否可用": gene is not None},
+              "基因标注参数": {"单季EPS同比下限%": GENE_EPS_Q_YOY_MIN,
+                               "三年EPS_CAGR下限%": GENE_EPS_CAGR3_MIN,
+                               "最新年报ROE下限%": GENE_ROE_MIN,
+                               "三年CAGR基期": f"最近年报年−{GENE_EPS_CAGR_YEARS}",
+                               "数据是否可用": gene is not None,
+                               "缺失代码": gene_failed},
               "粗筛池": len(pool), "入选数": len(final),
               "剔除非": dict(sorted(rej.items(), key=lambda kv: -kv[1])),
               "名单": final}
