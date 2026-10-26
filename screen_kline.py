@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-K线选股规则 v2.8 —— 每周选股（扫描周期 K = 5 个交易日）
+K线选股规则 v3.4 —— 每周选股（扫描周期 K = 5 个交易日）
 
-规则说明见同目录 K线选股规则_v2.md
+规则说明见同目录 K线选股规则_v3.md
 v2 的含义 = 加入了「超级成长股基因」的标注工作（见下），选股参数与裁决条件未变。
 v2.6 为 P0 工程修复；v2.7 为 P1-A 候选池上下限调整（CHG_LO 2.0→0.5、CHG_HI 9.5→20.5）；
-v2.8 把第九节基因口径整体替换为「单季EPS同比 / 三年EPS CAGR / 年报ROE」。
+v2.8 把第九节基因口径整体替换为「单季EPS同比 / 三年EPS CAGR / 年报ROE」；
+v2.9 新增「业绩转变」三件套标注（第十节，只标注，不参与裁决）；
+v3.0 仅版本号升级（文件名改为 `_v3.md`），规则与 v2.9 相同；
+v3.1 修正 ② 订单代理字段（AdvancePayment→AdvanceReceipts），规模门槛 3%→2%；
+v3.2 新增「财务健康提示」列（现金短债比/净现比/应收增速差/速动比率）；
+v3.3 单季 EPS 同比门槛 40%→30%；
+v3.4 三件套得分改为加权分（①3 / ②2 / ③1，满分 6）。
 
 目录结构：
     /home/kevin/week_select_stocks/
-    ├── K线选股规则_v2.md
+    ├── K线选股规则_v3.md
     ├── screen_kline.py          本程序
     ├── database/                从平台下载的原始数据（按日期命名）
     │   ├── cross_<起>_<止>.json     横截面粗筛原始返回
@@ -18,6 +24,8 @@ v2.8 把第九节基因口径整体替换为「单季EPS同比 / 三年EPS CAGR 
     │   ├── kline_<起>_<止>.json     候选并集的日K线原始数据
     │   ├── quote_<基准日>.json      最终名单的行情快照
     │   ├── finance_<基准日>.json    基因标注用的候选股财务历史（利润表）
+    │   ├── finance_bal_<基准日>.json    业绩转变②用的资产负债表（合同负债/预收款项）
+    │   ├── finance_ratio_<基准日>.json  业绩转变①③用的财务比率总表（单季毛利率/现金流）
     │   └── result_<基准日>.json     本次运行结果与逐条剔除明细（便于追溯）
     └── csv/
         └── 选股_<基准日>.csv         按规则选出的股票
@@ -33,7 +41,7 @@ v2.8 把第九节基因口径整体替换为「单季EPS同比 / 三年EPS CAGR 
 超级成长基因标注（v2.8，即规则文档第九节）：
     在已选出的股票后面加一列「超级成长基因」（是/否/无数据），仅作标注，
     **不筛选、不排序、不影响入选名单**。下列三条同时成立才算「是」：
-      ① 最新单季 EPS 同比增长率 > 40%
+      ① 最新单季 EPS 同比增长率 > 30%
       ② 过去三年 EPS 年均复合增长率 > 25%
       ③ 最新年报 ROE > 17%
     口径：
@@ -47,14 +55,48 @@ v2.8 把第九节基因口径整体替换为「单季EPS同比 / 三年EPS CAGR 
     财务数据获取失败时该列留空（不标「否」），并在 stderr 给出告警；
     单只股票无财务数据时标「无数据」。二者都不得误读成「已确认没有基因」。
 
+业绩转变标注（v3.2，即规则文档第十节）：
+    在「超级成长基因」之后再加一组「业绩转变」列，同样**只标注**，
+    **不筛选、不排序、不改变入选名单**。三件套（三条同时成立才标「是」）：
+      ① 单季毛利率最近 2 个季度严格递增（GM[t-1] < GM[t]），
+         且最新一季营收环比不为负，且最新单季 > 上年同季（季节性护栏）；
+      ② 合同负债+预收款项 同比 ≥20%，且 ÷ 营业总收入TTM ≥2%；
+      ③ 经营现金流TTM >0，且（OCF由负转正 或 归母净利润TTM ≤0 或 OCF/NP >1）。
+    口径：
+      · ① 用 balancesheet 的 GrossIncomeRatio_Q（单季毛利率，%）；缺失时用
+        income 的累计营收/成本差分兜底。同比护栏默认开启
+        （TURN_GM_REQUIRE_YOY=True）：最新单季必须高于上年同季，
+        避免把纯季节性改善误判成拐点；营收环比只查最新一季 vs 上一季。
+      · ② 订单代理 = ContractLiability + AdvanceReceipts；同比对比上年同季，
+        不用年初至今，避免把「Q3 相对年末回升」误读成订单增长。
+      · ③ 用 TTM 口径；亏损但经营现金流为正（爱旭/达实这类）算通过。
+      · 三张表都按 InfoPublDate ≤ 基准日过滤，避免未来函数。
+      · 银行/保险/券商无毛利率、无合同负债语义 → 标「不适用」，不标「否」。
+    财务数据失败时整列留空（不标「否」）；单只无数据标「无数据」。
+
+财务健康提示（v3.2，只提示，不参与裁决）：
+    在「业绩转变」5 列之后再增加 1 列「财务健康提示」，回答
+    「这家公司的财务报表有没有明显的危险信号」。四项：
+      ① 现金短债比 = 货币资金 ÷ (短期借款 + 一年内到期的非流动负债)
+         <1.0 紧张，<0.5 高危；取最新报告期。
+      ② 净现比 = 经营现金流净额 ÷ 归母净利润
+         最近 2 个年报均 <0.5（负值也算）→ 高危；只有最新一年 <0.5 → 关注。
+      ③ 应收增速差 = 应收账款增速 − 营收增速
+         最近 2 个年报均 >+15pct → 高危；只有最新一年 >+15pct → 关注。
+      ④ 速动比率 = (流动资产 − 存货) ÷ 流动负债
+         <0.7 → 关注/计 1 分；取最新报告期。
+    危险程度：高危（任一高危项，或合计 ≥2 分）/ 关注（1 分或单项预警）/
+    正常（未触发）/ 数据不足。货币资金用 CashEquivalents 近似；接口没有
+    「受限资金」字段，因此无法真正剔除受限。应收用 BillAccReceivable。
+
 ⚠️ 修改登记规范（2026-10-15 15:47 起）：
-    本程序的每次修改，都必须在 K线选股规则_v2.md 的「十、版本沿革」表中
+    本程序的每次修改，都必须在 K线选股规则_v3.md 的「十一、版本沿革」表中
     登记「修改时间」（精确到分钟）与变更内容。未登记时间的修改视为不合规。
-    最近一次：2026-10-25 10:08（v2.8，第九节基因改为 EPS 单季同比/三年 CAGR/年报 ROE）
-    上一条　：2026-10-23 20:14（v2.7，P1-A：涨幅区间 0.5~20.5，候选池上限/下限调整）
-    上上条　：2026-10-23 19:18（v2.6，P0：K线截断/缓存签名/本地复核/交易日校验/OHLC 落盘）
-    上上上条：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
-    更早　　：2026-10-16 11:55（v2.3，据 18 周回测调参：C2 0.5%→1%，基因③ 25%→20%）
+    最近一次：2026-10-26 15:30（v3.4，三件套得分改为加权分 ①3/②2/③1，满分 6）
+    上一条　：2026-10-26 15:20（v3.3，单季 EPS 同比门槛 40%→30%）
+    上上条　：2026-10-26 15:16（v3.2，新增「财务健康提示」列；只提示，不参与裁决）
+    上上上条：2026-10-26 15:03（v3.1，② 订单代理改用 AdvanceReceipts，规模门槛 3%→2%）
+    更早　　：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
     　　　　：2026-10-16 09:42（v2.0，文档改名 v1→v2，程序内引用同步；逻辑未变）
     　　　　：2026-10-16 09:39（v1.3，新增「超级成长基因」标注列）
     　　　　：2026-10-15 15:49（v1.2，文件头补本条规范）
@@ -77,7 +119,7 @@ CSVDIR = os.path.join(HERE, "csv")
 
 W = os.path.expanduser("~/.local/bin/westock")
 
-# ---------------- 规则参数（见 K线选股规则_v2.md 第三节） ----------------
+# ---------------- 规则参数（见 K线选股规则_v3.md 第三节） ----------------
 K_VOL = 1.75          # ② 启动日放量倍数
 CHG_LO, CHG_HI = 0.5, 20.5    # ③ 当日涨幅区间 %（v2.7：原 2.0~9.5）
 FLOW_MIN = 0.2        # ③ 主力净流入 / 流通市值 下限 %
@@ -106,15 +148,48 @@ CROSS_CACHE_VERSION = 2
 # 定位：在已选出的股票后面标注「是否具备超级成长股的基因底子」，
 #       供人工精筛参考。**它不筛选、不排序、不影响入选名单**。
 # 三条同时成立才标「是」：
-#   ① 最新单季 EPS 同比增长率 > 40%
+#   ① 最新单季 EPS 同比增长率 > 30%
 #   ② 过去三年 EPS 年均复合增长率 > 25%
 #   ③ 最新年报 ROE > 17%
-GENE_EPS_Q_YOY_MIN = 40.0    # ① 单季 EPS 同比下限（%）
+GENE_EPS_Q_YOY_MIN = 30.0    # ① 单季 EPS 同比下限（%）
 GENE_EPS_CAGR3_MIN = 25.0    # ② 三年 EPS CAGR 下限（%）
 GENE_ROE_MIN = 17.0          # ③ 最新年报 ROE 下限（%）
 GENE_EPS_CAGR_YEARS = 3      # ② 复合增长年数：最近年报 Y 对比 Y−3
 GENE_FIN_PERIODS = 20        # data_finance 拉取期数（5 年，够算 3 年 CAGR）
 GENE_FIN_BATCH = 10          # data_finance 单批股票数
+
+# ---------------- 业绩转变标注（只标注，不参与任何裁决） ----------------
+# 定位：在「超级成长基因」之后再加一组列，回答「有没有出现业绩拐点」，
+#       同样**不筛选、不排序、不影响入选名单**。三条同时成立才标「是」：
+#   ① 单季毛利率最近 2 个季度严格递增（GM[t-1] < GM[t]）
+#      + 最新一季营收环比不为负 + 最新单季高于上年同季
+#   ② 合同负债+预收款项 同比 ≥20%，且 ÷ 营业总收入TTM ≥2%
+#   ③ 经营现金流TTM >0，且（由负转正 或 归母净利润TTM ≤0 或 OCF/NP >1）
+TURN_GM_REQUIRE_YOY = True   # ① 同比护栏：最新单季毛利率须高于上年同季
+TURN_CL_YOY_MIN = 20.0       # ② 订单代理同比下限（%）
+TURN_CL_REV_MIN = 2.0        # ② 订单代理 / 营业总收入TTM 下限（%）
+TURN_OCF_NP_MIN = 1.0        # ③ 经营现金流TTM / 归母净利润TTM 下限
+# 三件套加权分：① 方向最强、② 持续性次之、③ 现金证伪最后。
+# 分值只用于排序/分诊，不改变「三条全过才是是」的判定。
+TURN_SCORE_GM = 3
+TURN_SCORE_CL = 2
+TURN_SCORE_OCF = 1
+TURN_SCORE_MAX = TURN_SCORE_GM + TURN_SCORE_CL + TURN_SCORE_OCF
+TURN_FIN_PERIODS = 20        # data_finance 拉取期数（5 年，足够看 2 季 + 同比）
+TURN_FIN_BATCH = 5           # 限频明显：单批 5 只，比基因的 10 只更稳
+TURN_FIN_SLEEP = 2.5         # 批间休眠（秒）
+TURN_FIN_RETRIES = 6         # 单批重试次数
+TURN_FIN_BACKOFF = 15.0      # 限频退避（秒）；普通失败按 3s×次数退避
+
+# ---------------- 财务健康提示（只提示，不参与任何裁决） ----------------
+# 四项：现金短债比、净现比、应收增速差、速动比率。
+# 现金短债比与速动比率取最新报告期；净现比、应收增速差看最近 2 个年报。
+HEALTH_CASH_DEBT_WARN = 1.0      # 现金短债比 <1.0 紧张
+HEALTH_CASH_DEBT_DANGER = 0.5    # <0.5 高危
+HEALTH_OCF_NP_WARN = 0.5         # 净现比连续 2 年 <0.5（或为负）
+HEALTH_AR_GAP_WARN = 15.0        # 应收增速差连续 2 年 >+15pct
+HEALTH_QUICK_WARN = 0.7          # 速动比率 <0.7
+HEALTH_ANNUAL_YEARS = 2          # “连续 N 年”的年报数
 
 # ⚠️ 表达式里的 `MainNetFlow > 0` 有两个作用，**不可删除**：
 #    ① 作为筛选条件，它确实被「净流入 ÷ 流通市值 ≥ 下限」蕴含（流通市值恒正）；
@@ -133,7 +208,9 @@ CSV_HEADER = ["基准交易日", "序号", "代码", "名称", "启动日", "距
               "5日净流入(万元)", "净流入占流通市值%", "收盘价",
               "距MA20%", "距MA60%", "MA20", "MA60", "MA20÷MA60",
               "流通市值(亿)", "总市值(亿)", "PE", "PB", "换手率%",
-              "超级成长基因"]
+              "超级成长基因",
+              "业绩转变", "三件套得分",
+              "毛利率递增", "订单代理", "经营现金流", "财务健康提示"]
 
 
 # ---------------- 基础工具 ----------------
@@ -509,8 +586,95 @@ def get_finance(codes, day, refresh):
     return cached, failed
 
 
+def fin_retry(fn, tries=TURN_FIN_RETRIES, what=""):
+    """财务接口专用重试：服务端「服务限频」需要长退避。
+
+    通用 retry() 的 1.5s 节奏对 data_finance 不够；实测限频后要等 10s 以上
+    才恢复，否则越试越糟。返回 None 表示彻底失败。
+    """
+    last = None
+    for i in range(tries):
+        try:
+            r = fn()
+            if r is not None:
+                return r
+        except Exception as e:
+            last = e
+            if i < tries - 1:
+                msg = str(e)
+                wait = TURN_FIN_BACKOFF if "限频" in msg else 3.0 * (i + 1)
+                sys.stderr.write(
+                    f"\n  [重试] {what}：{msg[:70]}，{wait:.0f}s 后重试\n")
+                time.sleep(wait)
+    sys.stderr.write(f"\n  [失败] {what}（重试 {tries} 次）：{last}\n")
+    return None
+
+
+def get_finance_stmt(codes, day, refresh, typ, fields, cache_name):
+    """拉取某类财务报表（balance / balancesheet）并按基准日缓存。
+
+    与 get_finance() 的差异：
+      · 单批更小、批间更慢，专门应对 data_finance 的「服务限频」；
+      · 批内缺失的代码会逐只补取一次；
+      · 只缓存有数据的股票，失败留下的空位下次运行会自动重试。
+    返回 ({code: [rows]}, 失败代码列表)。
+    """
+    path = os.path.join(DB, cache_name.format(day=day))
+    cached = {} if refresh else jload(path, {})
+    todo = [c for c in codes if c not in cached]
+    failed = []
+    if not todo:
+        return cached, failed
+    try:
+        wk = _westock_module()
+    except Exception as e:
+        sys.stderr.write(f"  [失败] 加载 westock 模块：{e}\n")
+        return cached, list(codes)
+
+    base = {"fields": fields, "num": TURN_FIN_PERIODS, "type": typ}
+    n_batch = (len(todo) + TURN_FIN_BATCH - 1) // TURN_FIN_BATCH
+    for i in range(0, len(todo), TURN_FIN_BATCH):
+        ch = todo[i:i + TURN_FIN_BATCH]
+        d = fin_retry(lambda ch=ch: wk.call(
+            "data_finance", dict(base, codes=",".join(ch))),
+            what=f"{typ} 第{i // TURN_FIN_BATCH + 1}/{n_batch} 批")
+        data = d.get("data") if isinstance(d, dict) else None
+        if isinstance(data, dict):
+            for c in ch:
+                rows = data.get(c)
+                if rows:
+                    cached[c] = rows
+        # 批内缺口逐只补取：服务端偶发只返回部分代码，不能当成「无数据」
+        missing = [c for c in ch if c not in cached]
+        for c in missing:
+            d1 = fin_retry(lambda c=c: wk.call(
+                "data_finance", dict(base, code=c)), what=f"{typ} 补取 {c}")
+            rows = ((d1 or {}).get("data") or {}).get(c) \
+                if isinstance(d1, dict) else None
+            if rows:
+                cached[c] = rows
+            else:
+                failed.append(c)
+            time.sleep(TURN_FIN_SLEEP)
+        jdump(path, cached)
+        sys.stderr.write(
+            f"\r  {typ} {i // TURN_FIN_BATCH + 1}/{n_batch} 批"
+            f"  库内 {len(cached)} 只")
+        sys.stderr.flush()
+        time.sleep(TURN_FIN_SLEEP)
+    if todo:
+        sys.stderr.write("\n")
+    return cached, failed
+
+
 def _pub_date(v):
     """InfoPublDate 形如 '2026-08-15 00:00:00 +0800 CST' → '2026-08-15'。"""
+    return str(v)[:10] if v else None
+
+
+def _end_date(r):
+    """报告期 EndDate → 'YYYY-MM-DD'。"""
+    v = r.get("EndDate") if isinstance(r, dict) else None
     return str(v)[:10] if v else None
 
 
@@ -624,6 +788,501 @@ def compute_gene(codes, day, refresh):
     return info, failed
 
 
+# ---------------- 业绩转变标注（只标注，不参与任何裁决） ----------------
+
+def _q_prev(dt):
+    """报告期 → 上一季末；非标准季末返回 None。"""
+    try:
+        y, m = int(dt[:4]), int(dt[5:7])
+    except (TypeError, ValueError):
+        return None
+    if m == 3:
+        return f"{y - 1}-12-31"
+    if m == 6:
+        return f"{y}-03-31"
+    if m == 9:
+        return f"{y}-06-30"
+    if m == 12:
+        return f"{y}-09-30"
+    return None
+
+
+def _order_proxy(r):
+    """订单代理 = 合同负债 + 预收款项；两者都没有返回 None。
+
+    ⚠️ 必须用 AdvanceReceipts（预收款项），不能用 AdvancePayment（预付款项）。
+    后者是公司付给供应商的资产，与客户预收方向相反。
+    """
+    cl = fnum(r.get("ContractLiability"))
+    ar = fnum(r.get("AdvanceReceipts"))
+    if cl is None and ar is None:
+        return None
+    return (cl or 0.0) + (ar or 0.0)
+
+
+def _stmt_latest(rows, day):
+    """基准日前最新一期报表；无则 None。"""
+    valid = [r for r in rows
+             if _pub_date(r.get("InfoPublDate")) and _end_date(r)
+             and _pub_date(r.get("InfoPublDate")) <= day]
+    return max(valid, key=_end_date) if valid else None
+
+
+def _stmt_annual(rows, day, n=3):
+    """基准日前最近 n 个年报（12-31），按报告期升序。"""
+    valid = [r for r in rows
+             if _pub_date(r.get("InfoPublDate")) and _end_date(r)
+             and _pub_date(r.get("InfoPublDate")) <= day
+             and _end_date(r).endswith("-12-31")]
+    valid.sort(key=_end_date)
+    return valid[-n:]
+
+
+def health_metrics(inc_rows, bal_rows, ratio_rows, day):
+    """四项财务健康提示：现金短债比、净现比、应收增速差、速动比率。
+
+    数据口径（westock data_finance）：
+      · 货币资金：`CashEquivalents`。接口没有单独的“受限资金”字段，
+        因此这里只能按货币资金近似，不能真正做到“剔除受限”。
+      · 短期有息负债：`ShortTermLoan` + `NonCurrentLiabilityIn1Year`。
+      · 应收：`BillAccReceivable`（应收票据及应收账款）；营收：`OperatingRevenue`。
+      · 净现比：年报 `NetOperateCashFlow` ÷ `NPParentCompanyOwners`。
+      · 速动比率：(流动资产 − 存货) ÷ 流动负债。
+
+    返回 dict，含 level（高危/关注/正常/数据不足）、desc、score 和原始值。
+    只提示，不参与筛选、排序或裁决。
+    """
+    b = _stmt_latest(bal_rows, day)
+    cash = fnum((b or {}).get("CashEquivalents"))
+    st = fnum((b or {}).get("ShortTermLoan"))
+    ncl = fnum((b or {}).get("NonCurrentLiabilityIn1Year"))
+    if st is None and ncl is None:
+        short_debt = None
+    else:
+        short_debt = (st or 0.0) + (ncl or 0.0)
+    cash_debt = (cash / short_debt if cash is not None and short_debt
+                 and short_debt > 0 else None)
+    ca = fnum((b or {}).get("TotalCurrentAssets"))
+    inv = fnum((b or {}).get("Inventories"))
+    cliab = fnum((b or {}).get("TotalCurrentLiability"))
+    quick = ((ca - inv) / cliab if ca is not None and inv is not None
+             and cliab and cliab > 0 else None)
+
+    # 净现比：最近 2 个年报
+    net_years = []
+    for r in _stmt_annual(ratio_rows, day, HEALTH_ANNUAL_YEARS):
+        dt = _end_date(r)
+        np_ = fnum(r.get("NPParentCompanyOwners"))
+        ocf = fnum(r.get("NetOperateCashFlow"))
+        ratio = (ocf / np_ if np_ not in (None, 0) and ocf is not None
+                 else None)
+        bad = ratio is not None and ratio < HEALTH_OCF_NP_WARN
+        net_years.append({"period": dt, "ocf": ocf, "np": np_,
+                          "ratio": ratio, "bad": bool(bad)})
+    net_bad = (len(net_years) >= HEALTH_ANNUAL_YEARS
+               and all(x["bad"] for x in net_years[-HEALTH_ANNUAL_YEARS:]))
+
+    # 应收增速差：最近 2 个年报，各自对比上一年
+    bal_map = {_end_date(r): r for r in bal_rows
+               if _pub_date(r.get("InfoPublDate"))
+               and _pub_date(r.get("InfoPublDate")) <= day}
+    inc_map = {_end_date(r): r for r in inc_rows
+               if _pub_date(r.get("InfoPublDate"))
+               and _pub_date(r.get("InfoPublDate")) <= day}
+    annual_dates = sorted(d for d in inc_map
+                          if d.endswith("-12-31") and d in bal_map)
+    ar_gaps = []
+    for dt in annual_dates[-HEALTH_ANNUAL_YEARS:]:
+        prev = f"{int(dt[:4]) - 1}-12-31"
+        if prev not in bal_map or prev not in inc_map:
+            continue
+        ar_now = fnum(bal_map[dt].get("BillAccReceivable"))
+        ar_prev = fnum(bal_map[prev].get("BillAccReceivable"))
+        rev_now = fnum(inc_map[dt].get("OperatingRevenue"))
+        rev_prev = fnum(inc_map[prev].get("OperatingRevenue"))
+        if None in (ar_now, ar_prev, rev_now, rev_prev):
+            continue
+        if ar_prev <= 0 or rev_prev <= 0:
+            continue
+        ar_gap = (ar_now / ar_prev - 1) * 100 - (rev_now / rev_prev - 1) * 100
+        ar_gaps.append({"period": dt, "gap": ar_gap,
+                        "ar_yoy": (ar_now / ar_prev - 1) * 100,
+                        "rev_yoy": (rev_now / rev_prev - 1) * 100})
+    ar_bad = (len(ar_gaps) >= HEALTH_ANNUAL_YEARS
+              and all(x["gap"] > HEALTH_AR_GAP_WARN
+                      for x in ar_gaps[-HEALTH_ANNUAL_YEARS:]))
+
+    score = 0
+    watch = False
+    flags = []
+    missing = []
+    if cash_debt is not None:
+        if cash_debt < HEALTH_CASH_DEBT_DANGER:
+            score += 2
+            flags.append(f"现金短债比 {cash_debt:.2f}（<{HEALTH_CASH_DEBT_DANGER:g} 高危）")
+        elif cash_debt < HEALTH_CASH_DEBT_WARN:
+            score += 1
+            flags.append(f"现金短债比 {cash_debt:.2f}（<{HEALTH_CASH_DEBT_WARN:g} 紧张）")
+    elif short_debt == 0:
+        flags.append("无短期有息负债")
+    else:
+        missing.append("现金短债比")
+    if net_bad:
+        score += 2
+        detail = "；".join(
+            f"{x['period'][:4]} " + (f"{x['ratio']:.2f}" if x["ratio"] is not None
+                                     else ("净利为0" if x["np"] == 0 else "—"))
+            for x in net_years[-HEALTH_ANNUAL_YEARS:])
+        flags.append(f"净现比连续{HEALTH_ANNUAL_YEARS}年<{HEALTH_OCF_NP_WARN:g}（{detail}）")
+    elif len(net_years) < HEALTH_ANNUAL_YEARS:
+        missing.append("净现比连续2年")
+    elif net_years and net_years[-1]["ratio"] is not None and \
+            net_years[-1]["ratio"] < HEALTH_OCF_NP_WARN:
+        flags.append(f"净现比最新 {net_years[-1]['ratio']:.2f}（未连续2年）")
+        watch = True
+    if ar_bad:
+        score += 2
+        detail = "；".join(f"{x['period'][:4]} {x['gap']:+.1f}pct"
+                           for x in ar_gaps[-HEALTH_ANNUAL_YEARS:])
+        flags.append(f"应收增速差连续{HEALTH_ANNUAL_YEARS}年>+{HEALTH_AR_GAP_WARN:g}pct（{detail}）")
+    elif len(ar_gaps) < HEALTH_ANNUAL_YEARS:
+        missing.append("应收增速差连续2年")
+    elif ar_gaps and ar_gaps[-1]["gap"] > HEALTH_AR_GAP_WARN:
+        flags.append(f"应收增速差最新 {ar_gaps[-1]['gap']:+.1f}pct（未连续2年）")
+        watch = True
+    if quick is not None:
+        if quick < HEALTH_QUICK_WARN:
+            score += 1
+            flags.append(f"速动比率 {quick:.2f}（<{HEALTH_QUICK_WARN:g}）")
+    else:
+        missing.append("速动比率")
+
+    valid_count = sum(x is not None for x in (cash_debt, quick)) + \
+        int(len(net_years) >= HEALTH_ANNUAL_YEARS) + \
+        int(len(ar_gaps) >= HEALTH_ANNUAL_YEARS)
+    if valid_count == 0:
+        level = "数据不足"
+    elif score >= 2:
+        level = "高危"
+    elif score == 1 or watch:
+        level = "关注"
+    else:
+        level = "正常"
+    desc_parts = []
+    if flags:
+        desc_parts.append("；".join(flags))
+    elif level == "正常":
+        desc_parts.append("四项未触发")
+    if missing:
+        desc_parts.append("缺：" + "、".join(missing))
+    desc = "；".join(desc_parts)
+    return {"level": level, "score": score, "desc": desc,
+            "cash_debt": cash_debt, "quick": quick,
+            "short_debt": short_debt, "cash": cash,
+            "net_cash_years": net_years, "net_bad": bool(net_bad),
+            "ar_gaps": ar_gaps, "ar_bad": bool(ar_bad),
+            "missing": missing}
+
+
+def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
+    """按基准日已披露的报表，计算「业绩转变」三件套。
+
+    ⚠️ 与基因标注一样，必须按 InfoPublDate ≤ day 过滤，避免未来函数。
+    返回 None 表示三张表在基准日前都没有可用报告期（→「无数据」）。
+    """
+    def pit(rows):
+        return [r for r in rows
+                if _pub_date(r.get("InfoPublDate")) and _end_date(r)
+                and _pub_date(r.get("InfoPublDate")) <= day]
+
+    inc = {_end_date(r): r for r in pit(inc_rows)}
+    bal = {_end_date(r): r for r in pit(bal_rows)}
+    rat = {_end_date(r): r for r in pit(ratio_rows)}
+    periods = set(inc) | set(bal) | set(rat)
+    if not periods:
+        return None
+
+    # ①③ 同出 balancesheet，优先以它的最新报告期为准，避免 income 缓存滞后；
+    # 缺 balancesheet 时退回 income，再退回 balance。
+    if rat:
+        t = max(rat)
+    elif inc:
+        t = max(inc)
+    else:
+        t = max(bal)
+
+    # ---- ① 最近 2 个单季毛利率递增 ----
+    gm = {}
+    for dt, r in rat.items():
+        v = fnum(r.get("GrossIncomeRatio_Q"))
+        if v is not None:
+            gm[dt] = v
+    # balancesheet 缺 GM_Q 时，用 income 累计营收/成本差分兜底
+    for dt, r in inc.items():
+        if dt in gm:
+            continue
+        rev = fnum(r.get("OperatingRevenue"))
+        cost = fnum(r.get("OperatingCost"))
+        if rev is None or cost is None or rev <= 0:
+            continue
+        m = int(dt[5:7])
+        if m == 3:
+            rq, cq = rev, cost
+        else:
+            pq = _q_prev(dt)
+            pr = inc.get(pq) if pq else None
+            if not pr:
+                continue
+            prv = fnum(pr.get("OperatingRevenue"))
+            pc = fnum(pr.get("OperatingCost"))
+            if prv is None or pc is None:
+                continue
+            rq, cq = rev - prv, cost - pc
+        if rq > 0:
+            gm[dt] = (rq - cq) / rq * 100
+
+    # 单季营收（用于「营收环比不为负」护栏）：优先 balancesheet 的 _Q 字段，
+    # 缺失时用 income 的累计值差分。
+    revq = {}
+    for dt, r in rat.items():
+        v = fnum(r.get("OperatingRevenue_Q"))
+        if v is not None:
+            revq[dt] = v
+    for dt, r in inc.items():
+        if dt in revq:
+            continue
+        rev = fnum(r.get("OperatingRevenue"))
+        if rev is None:
+            continue
+        m = int(dt[5:7])
+        if m == 3:
+            rq = rev
+        else:
+            pq = _q_prev(dt)
+            pr = inc.get(pq) if pq else None
+            if not pr:
+                continue
+            prv = fnum(pr.get("OperatingRevenue"))
+            if prv is None:
+                continue
+            rq = rev - prv
+        if rq is not None:
+            revq[dt] = rq
+
+    gm_applicable = bool(gm)
+    q2 = _q_prev(t)
+    g2, g3 = gm.get(q2), gm.get(t)
+    gm_ok = g2 is not None and g3 is not None and g2 < g3
+    yoy_dt = f"{int(t[:4]) - 1}{t[4:]}"
+    gm_yoy = gm.get(yoy_dt)
+    gm_yoy_ok = gm_yoy is not None and g3 is not None and g3 > gm_yoy
+
+    # 「营收环比不为负」：只检查最新一季 vs 上一季
+    r2, r3 = revq.get(q2), revq.get(t)
+    rev_ok = r2 is not None and r3 is not None and r3 >= r2
+    if r2 is not None and r3 is not None:
+        if r2 > 0:
+            rev_txt = f"营收环比 {(r3 / r2 - 1) * 100:+.1f}%"
+        else:
+            rev_txt = "营收环比 不可比（基期为0）"
+        if not rev_ok:
+            rev_txt += "（最新一季营收环比为负）"
+    else:
+        rev_txt = "营收环比 数据不足"
+
+    p1 = gm_ok and rev_ok and (not TURN_GM_REQUIRE_YOY or gm_yoy_ok)
+    gm_text = "→".join("-" if v is None else f"{v:.2f}" for v in (g2, g3))
+    if not gm_applicable:
+        why1 = "① 无毛利率数据"
+        gm_desc = "无毛利率数据"
+    elif g2 is None or g3 is None:
+        why1 = "① 近2季单季毛利率数据不足"
+        gm_desc = f"{gm_text}；数据不足（需最近2个单季）"
+    else:
+        if not gm_ok:
+            why1 = "① 近2季毛利率未环比改善"
+            state = "环比未改善"
+        elif not rev_ok:
+            if r2 is None or r3 is None:
+                why1 = "① 营收环比数据不足"
+                state = "毛利率改善但营收环比数据不足"
+            else:
+                why1 = "① 毛利率改善但营收环比不达标"
+                state = "毛利率改善但营收环比不达标"
+        elif TURN_GM_REQUIRE_YOY and gm_yoy is None:
+            why1 = "① 上年同季毛利率缺失，无法确认同比"
+            state = "毛利率与营收达标，但同比不可比"
+        elif TURN_GM_REQUIRE_YOY and not gm_yoy_ok:
+            why1 = "① 最新单季毛利率未高于上年同季"
+            state = "毛利率与营收达标，但未高于上年同季"
+        else:
+            why1 = ""
+            state = "环比改善"
+        if gm_yoy is None:
+            yoy_txt = "同比 无数据"
+        else:
+            yoy_txt = (f"同比 {g3 - gm_yoy:+.2f}pct"
+                       f"（上年同季 {gm_yoy:.2f}%）")
+        gm_desc = f"{gm_text}（{state}）；{rev_txt}；{yoy_txt}"
+
+    # ---- ② 合同负债 / 在手订单增长 ----
+    bdt = t if t in bal else max((d for d in bal if d <= t), default=None)
+    cl_now = _order_proxy(bal[bdt]) if bdt else None
+    cl_part = fnum((bal.get(bdt) or {}).get("ContractLiability")) if bdt else None
+    ar_part = fnum((bal.get(bdt) or {}).get("AdvanceReceipts")) if bdt else None
+    cl_prev = cl_growth = cl_ratio = None
+    if bdt and cl_now is not None:
+        prev_dt = f"{int(bdt[:4]) - 1}{bdt[4:]}"
+        if prev_dt in bal:
+            cl_prev = _order_proxy(bal[prev_dt])
+        if cl_prev is not None and cl_prev > 0:
+            cl_growth = (cl_now / cl_prev - 1) * 100
+    rev_ttm = fnum((inc.get(t) or {}).get("OperatingRevenueTTM"))
+    if rev_ttm is None:
+        rev_ttm = fnum((rat.get(t) or {}).get("OperatingRevenueTTM"))
+    if cl_now is not None and rev_ttm and rev_ttm > 0:
+        cl_ratio = cl_now / rev_ttm * 100
+    cl_applicable = cl_now is not None
+    p2 = (cl_growth is not None and cl_growth >= TURN_CL_YOY_MIN
+          and cl_ratio is not None and cl_ratio >= TURN_CL_REV_MIN)
+    if not cl_applicable:
+        why2 = "② 无合同负债/预收数据"
+    elif cl_growth is None:
+        why2 = "② 上年同期订单代理缺失或为0"
+    elif cl_growth < TURN_CL_YOY_MIN:
+        why2 = f"② 订单同比 {cl_growth:.1f}% < {TURN_CL_YOY_MIN:g}%"
+    elif cl_ratio is None:
+        why2 = "② 营业总收入TTM缺失"
+    elif cl_ratio < TURN_CL_REV_MIN:
+        why2 = f"② 订单/营收 {cl_ratio:.1f}% < {TURN_CL_REV_MIN:g}%"
+    else:
+        why2 = ""
+
+    if not cl_applicable:
+        cl_desc = "无合同负债/预收数据"
+    else:
+        cl_txt = (f"合同负债 {(cl_part or 0) / 1e8:.2f}亿"
+                  f" + 预收款项 {(ar_part or 0) / 1e8:.2f}亿"
+                  f" = {cl_now / 1e8:.2f}亿")
+        growth_txt = ("同比 不可比（上年同季缺失或为0）"
+                      if cl_growth is None else f"同比 {cl_growth:+.1f}%")
+        ratio_txt = ("占营收TTM 无数据"
+                     if cl_ratio is None else f"占营收TTM {cl_ratio:.1f}%")
+        cl_desc = f"{cl_txt}；{growth_txt}；{ratio_txt}"
+
+    # ---- ③ 经营现金流由负转正 / 现金流净利润 > 1 ----
+    rt = rat.get(t) or {}
+    ocf = fnum(rt.get("NetOperateCashFlowTTM"))
+    np_ = fnum(rt.get("NPParentCompanyOwnersTTM"))
+    if np_ is None:
+        np_ = fnum((inc.get(t) or {}).get("NPParentCompanyOwnersTTM"))
+    ocf_prev = fnum((rat.get(yoy_dt) or {}).get("NetOperateCashFlowTTM"))
+    ratio = (ocf / np_ if ocf is not None and np_ is not None and np_ > 0
+             else None)
+    turn_pos = (ocf is not None and ocf > 0 and ocf_prev is not None
+                and ocf_prev < 0)
+    p3 = (ocf is not None and ocf > 0
+          and (turn_pos or (np_ is not None and np_ <= 0)
+               or (ratio is not None and ratio >= TURN_OCF_NP_MIN)))
+    if ocf is None:
+        why3 = "③ 经营现金流TTM缺失"
+    elif ocf <= 0:
+        why3 = f"③ 经营现金流TTM {ocf / 1e8:.1f}亿 ≤ 0"
+    elif turn_pos:
+        why3 = ""
+    elif np_ is None:
+        why3 = "③ 归母净利润TTM缺失"
+    elif np_ > 0 and (ratio is None or ratio < TURN_OCF_NP_MIN):
+        why3 = f"③ 现金流/净利润 {ratio:.2f} < {TURN_OCF_NP_MIN:g}"
+    else:
+        why3 = ""
+
+    if ocf is None or np_ is None:
+        ocf_np_text = ""
+    elif np_ <= 0:
+        ocf_np_text = "亏损/正" if ocf > 0 else "亏损/负"
+    else:
+        ocf_np_text = f"{ratio:.2f}" if ratio is not None else ""
+
+    if ocf is None:
+        ocf_desc = "经营现金流TTM 无数据"
+    else:
+        turn_txt = ("（由负转正）"
+                    if ocf > 0 and ocf_prev is not None and ocf_prev < 0
+                    else "")
+        np_txt = ("净利润TTM 无数据" if np_ is None
+                  else f"净利润TTM {np_ / 1e8:+.2f}亿")
+        if np_ is None:
+            ratio_txt = ""
+        elif np_ <= 0:
+            ratio_txt = "；亏损/正" if ocf > 0 else "；亏损/负"
+        else:
+            ratio_txt = (f"；OCF/NP {ratio:.2f}" if ratio is not None
+                         else "；OCF/NP 无数据")
+        ocf_desc = f"OCF_TTM {ocf / 1e8:+.2f}亿{turn_txt}；{np_txt}{ratio_txt}"
+
+    health = health_metrics(inc_rows, bal_rows, ratio_rows, day)
+
+    # 银行/保险/券商：没有毛利率、也没有合同负债语义 → 整体「不适用」
+    applicable = gm_applicable or cl_applicable
+    if not applicable:
+        return {"label": "不适用", "score": None, "applicable": False,
+                "reason": "；".join(x for x in (why1, why2, why3) if x),
+                "period": t, "gm_text": gm_text, "gm": [g2, g3],
+                "gm_yoy": gm_yoy, "gm_desc": gm_desc,
+                "rev_q": [r2, r3], "rev_ok": bool(rev_ok),
+                "cl_growth": cl_growth, "cl_ratio": cl_ratio,
+                "cl_part": cl_part, "ar_part": ar_part, "cl_desc": cl_desc,
+                "ocf_np_text": ocf_np_text, "ocf_desc": ocf_desc,
+                "ocf_ttm": ocf, "np_ttm": np_, "ocf_prev": ocf_prev,
+                "health": health, "health_label": "不适用",
+                "health_desc": "金融行业，四项指标不适用",
+                "p1": False, "p2": False, "p3": False}
+
+    score = ((TURN_SCORE_GM if p1 else 0) +
+             (TURN_SCORE_CL if p2 else 0) +
+             (TURN_SCORE_OCF if p3 else 0))
+    label = "是" if (p1 and p2 and p3) else ("部分" if score else "否")
+    reasons = [x for x in (why1, why2, why3) if x]
+    return {"label": label, "score": score, "applicable": True,
+            "reason": "；".join(reasons),
+            "period": t,
+            "gm": [g2, g3], "gm_text": gm_text, "gm_desc": gm_desc,
+            "gm_yoy": round(gm_yoy, 2) if gm_yoy is not None else None,
+            "rev_q": [r2, r3], "rev_ok": bool(rev_ok),
+            "cl_period": bdt,
+            "cl_growth": round(cl_growth, 2) if cl_growth is not None else None,
+            "cl_ratio": round(cl_ratio, 2) if cl_ratio is not None else None,
+            "cl_part": cl_part, "ar_part": ar_part, "cl_desc": cl_desc,
+            "ocf_ttm": ocf, "np_ttm": np_, "ocf_prev": ocf_prev,
+            "ocf_np": round(ratio, 3) if ratio is not None else None,
+            "ocf_np_text": ocf_np_text, "ocf_desc": ocf_desc,
+            "health": health, "health_label": health["level"],
+            "health_desc": health["desc"],
+            "p1": bool(p1), "p2": bool(p2), "p3": bool(p3)}
+
+
+def compute_turnaround(codes, day, refresh):
+    """返回 ({code: metrics}, 失败代码列表)；全部失败返回 (None, codes)。"""
+    if not codes:
+        return {}, []
+    inc, fail_inc = get_finance(codes, day, refresh)
+    bal, fail_bal = get_finance_stmt(
+        codes, day, refresh, "balance", "all", "finance_bal_{day}.json")
+    rat, fail_rat = get_finance_stmt(
+        codes, day, refresh, "balancesheet", "all", "finance_ratio_{day}.json")
+    if not inc and not bal and not rat:
+        return None, sorted(set(fail_inc + fail_bal + fail_rat))
+    info = {}
+    for c in codes:
+        m = turnaround_metrics(inc.get(c) or [], bal.get(c) or [],
+                               rat.get(c) or [], day)
+        if m is not None:
+            info[c] = m
+    failed = sorted(set(fail_inc) | set(fail_bal) | set(fail_rat))
+    return info, failed
+
+
 # ---------------- 裁决 ----------------
 
 def find_start(code, name, bars, S):
@@ -711,7 +1370,7 @@ def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
 # ---------------- 主流程 ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="K线选股规则 v2.8（每周选股，K=5）")
+    ap = argparse.ArgumentParser(description="K线选股规则 v3.4（每周选股，K=5）")
     ap.add_argument("--date", help="基准交易日（默认最近交易日）")
     ap.add_argument("--n", type=int, default=4,
                     help="新鲜度窗口，必须 = 扫描周期−1（每周 K=5 用 4=默认；"
@@ -904,6 +1563,55 @@ def main():
         n_na = sum(1 for x in final if x["gene"] == "无数据")
         print(f"      基因标注：是 {n_yes} 只 ｜ 否 {n_no} 只 ｜ 无数据 {n_na} 只")
 
+    # ---- 业绩转变标注（只标注，不影响上面任何裁决结果）----
+    turn, turn_failed = compute_turnaround(
+        [x["code"] for x in final], S, a.refresh)
+    if turn is None:
+        print("      ⚠️ 财务数据获取失败：「业绩转变」列留空（选股结果不受影响）",
+              file=sys.stderr)
+    elif turn_failed:
+        print(f"      ⚠️ {len(turn_failed)} 只财务数据缺失，标「无数据」："
+              f"{', '.join(turn_failed[:8])}{'…' if len(turn_failed) > 8 else ''}",
+              file=sys.stderr)
+    for x in final:
+        if turn is None:
+            x.update({"turn_label": "", "turn_score": "", "turn_detail": None,
+                      "turn_gm": "", "turn_cl": "", "turn_ocf": "",
+                      "health_label": "", "health_desc": "",
+                      "health_detail": None})
+            continue
+        m = turn.get(x["code"])
+        if m is None:
+            x.update({"turn_label": "无数据", "turn_score": "",
+                      "turn_detail": None, "turn_gm": "",
+                      "turn_cl": "", "turn_ocf": "",
+                      "health_label": "数据不足",
+                      "health_desc": "财务数据缺失", "health_detail": None})
+            continue
+        x["turn_label"] = m["label"]
+        x["turn_score"] = m["score"] if m["score"] is not None else ""
+        x["turn_detail"] = m
+        x["turn_gm"] = m.get("gm_desc") or ""
+        x["turn_cl"] = m.get("cl_desc") or ""
+        x["turn_ocf"] = m.get("ocf_desc") or ""
+        x["health_label"] = m.get("health_label") or ""
+        x["health_desc"] = m.get("health_desc") or ""
+        x["health_detail"] = m.get("health")
+    for x in final:
+        if x.get("health_label"):
+            x["health_text"] = (x["health_label"] + "：" +
+                                x.get("health_desc", "")) if x.get("health_desc") \
+                else x["health_label"]
+        else:
+            x["health_text"] = ""
+    if turn is not None and final:
+        order = ["是", "部分", "否", "无数据", "不适用"]
+        cnt = {k: 0 for k in order}
+        for x in final:
+            cnt[x["turn_label"]] = cnt.get(x["turn_label"], 0) + 1
+        print("      业绩转变：" + " ｜ ".join(
+            f"{k} {cnt[k]} 只" for k in order))
+
     final.sort(key=lambda x: (x["age"], -x["vcross"]))
 
     # ---- 写 CSV ----
@@ -922,6 +1630,9 @@ def main():
                 x.get("float_cap_yi"), x.get("total_cap_yi"),
                 x.get("pe"), x.get("pb"), x.get("turnover"),
                 x.get("gene", ""),
+                x.get("turn_label", ""), x.get("turn_score", ""),
+                x.get("turn_gm", ""), x.get("turn_cl", ""),
+                x.get("turn_ocf", ""), x.get("health_text", ""),
             ])
 
     # ---- 写运行明细（便于追溯）----
@@ -937,6 +1648,33 @@ def main():
                                "三年CAGR基期": f"最近年报年−{GENE_EPS_CAGR_YEARS}",
                                "数据是否可用": gene is not None,
                                "缺失代码": gene_failed},
+              "业绩转变参数": {"三件套权重": {"①毛利率": TURN_SCORE_GM,
+                                                "②订单": TURN_SCORE_CL,
+                                                "③现金流": TURN_SCORE_OCF},
+                               "三件套满分": TURN_SCORE_MAX,
+                               "①毛利率环比季数": 2,
+                               "①营收环比不为负": True,
+                               "①最新单季毛利率高于上年同季": TURN_GM_REQUIRE_YOY,
+                               "②合同负债+预收同比下限%": TURN_CL_YOY_MIN,
+                               "②订单代理字段": "ContractLiability+AdvanceReceipts",
+                               "②订单/营收TTM下限%": TURN_CL_REV_MIN,
+                               "③经营现金流TTM下限": 0,
+                               "③现金流/净利润下限": TURN_OCF_NP_MIN,
+                               "③OCF由负转正算通过": True,
+                               "③亏损但OCF为正算通过": True,
+                               "数据是否可用": turn is not None,
+                               "缺失代码": turn_failed},
+              "财务健康参数": {
+                  "现金短债比紧张阈值": HEALTH_CASH_DEBT_WARN,
+                  "现金短债比高危阈值": HEALTH_CASH_DEBT_DANGER,
+                  "净现比下限": HEALTH_OCF_NP_WARN,
+                  "净现比连续年数": HEALTH_ANNUAL_YEARS,
+                  "应收增速差上限pct": HEALTH_AR_GAP_WARN,
+                  "应收增速差连续年数": HEALTH_ANNUAL_YEARS,
+                  "速动比率下限": HEALTH_QUICK_WARN,
+                  "货币资金口径": "CashEquivalents（接口无受限资金字段，未剔受限）",
+                  "应收口径": "BillAccReceivable",
+                  "短期有息负债口径": "ShortTermLoan + NonCurrentLiabilityIn1Year"},
               "粗筛池": len(pool), "入选数": len(final),
               "剔除非": dict(sorted(rej.items(), key=lambda kv: -kv[1])),
               "名单": final}
@@ -951,7 +1689,8 @@ def main():
     if final:
         print(f"\n{'代码':10s}{'名称':9s}{'启动日':12s}{'距启动':>6s}"
               f"{'量能':>7s}{'距MA20':>8s}{'距MA60':>8s}{'市值比':>8s}"
-              f"{'流通市值亿':>11s}{'PE':>10s}{'基因':>7s}")
+              f"{'流通市值亿':>11s}{'PE':>10s}{'基因':>7s}"
+              f"{'转变':>7s}{'分':>3s}")
         for x in final:
             print(f"{x['code']:10s}{(x.get('name') or '')[:8]:9s}"
                   f"{x['d_star']:12s}{x['age']:6d}{x['vcross']:7.2f}"
@@ -959,7 +1698,9 @@ def main():
                   f"{(x.get('flow_ratio') or 0):7.2f}%"
                   f"{str(x.get('float_cap_yi') or '-'):>11s}"
                   f"{str(x.get('pe') or '-'):>10s}"
-                  f"{str(x.get('gene') or '-'):>7s}")
+                  f"{str(x.get('gene') or '-'):>7s}"
+                  f"{str(x.get('turn_label') or '-'):>7s}"
+                  f"{str(x.get('turn_score') if x.get('turn_score') != '' else '-'):>3s}")
     print(f"\nCSV    : {csv_path}")
     print(f"明细   : {res_path}")
     print(f"原始数据: {DB}/")
