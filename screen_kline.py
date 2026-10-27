@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-K线选股规则 v3.4 —— 每周选股（扫描周期 K = 5 个交易日）
+K线选股规则 v3.5 —— 每周选股（扫描周期 K = 5 个交易日）
 
 规则说明见同目录 K线选股规则_v3.md
 v2 的含义 = 加入了「超级成长股基因」的标注工作（见下），选股参数与裁决条件未变。
@@ -12,16 +12,22 @@ v3.0 仅版本号升级（文件名改为 `_v3.md`），规则与 v2.9 相同；
 v3.1 修正 ② 订单代理字段（AdvancePayment→AdvanceReceipts），规模门槛 3%→2%；
 v3.2 新增「财务健康提示」列（现金短债比/净现比/应收增速差/速动比率）；
 v3.3 单季 EPS 同比门槛 40%→30%；
-v3.4 三件套得分改为加权分（①3 / ②2 / ③1，满分 6）。
+v3.4 三件套得分改为加权分（①3 / ②2 / ③1，满分 6）；
+v3.5 口径收紧（P1/P2）：①市值比分母改用 d* 日流通市值（与分子同日）；
+     ②judge() 补 S 日 ST/次新复检；③find_start() 补「真上穿」断言；
+     ④行业「不适用」改用 EnterpriseType 判定，字段缺失另计「数据缺失」；
+     ⑤删除假参数 LISTED_YEARS；⑥交易日历起点动态化 + 截断报错。
 
 目录结构：
-    /home/kevin/week_select_stocks/
+    /home/kevin/MyData/kline-select-stocks-approach/
     ├── K线选股规则_v3.md
     ├── screen_kline.py          本程序
     ├── database/                从平台下载的原始数据（按日期命名）
-    │   ├── cross_<起>_<止>.json     横截面粗筛原始返回
-    │   ├── labels_<起>_<止>.json    排除集原始返回（ST + 次新分桶）
+    │   ├── cross_<交易日>.json      横截面粗筛原始返回
+    │   ├── cross_<交易日>.meta.json 粗筛缓存签名（表达式/参数/版本）
+    │   ├── labels_<交易日>.json     排除集原始返回（ST + 次新分桶）
     │   ├── kline_<起>_<止>.json     候选并集的日K线原始数据
+    │   ├── mv_<交易日>.json         全市场流通/总市值 {code: [流通, 总]}（元）
     │   ├── quote_<基准日>.json      最终名单的行情快照
     │   ├── finance_<基准日>.json    基因标注用的候选股财务历史（利润表）
     │   ├── finance_bal_<基准日>.json    业绩转变②用的资产负债表（合同负债/预收款项）
@@ -126,12 +132,15 @@ FLOW_MIN = 0.2        # ③ 主力净流入 / 流通市值 下限 %
 C3_RATIO = 0.98       # ④ MA20 >= MA60 × 该值
 C2_TOL = 0.01         # ④ MA20 近5日跌幅容忍度（v2.3 由 0.005 放宽；18周实测 0.005 偏紧）
 MA60_GAP = 0.0        # 条件9 close/MA60 上限；0 = 关闭（已评估为失效）
-LISTED_YEARS = 3      # ⑤ 上市满 N 年
 KLINE_BATCH = 20      # westock kline 单批上限
 LABEL_PAGE = 500
 KLINE_LOOKBACK_DAYS = 300   # K线回溯长度（自然日），保证 MA60 与启动日检测有足够历史
 MIN_HISTORY = 70      # find_start 要求基准日 S 的索引 i ≥ 70（即含当日共 ≥71 根）
                       # ⚠️ 补取分支曾只存 1 根，i 恒为 0 → 合格股被误报「K线历史不足(0根)」
+
+# v3.5：删除 LISTED_YEARS（原「上市满 N 年」）。它从不参与裁决——次新剔除实际由
+# 服务端标签 NEW_LABELS 的四个分桶并集决定（见 get_labels / judge 的 ⑤），
+# 保留该常量会让使用者「改了参数却没有任何变化」，且被写进 result_*.json 造成假象。
 
 # ---------------- 缓存/数据完整性（v2.6，P0） ----------------
 # K 线 bar 的落盘格式（v2.6 起）：
@@ -139,6 +148,25 @@ MIN_HISTORY = 70      # find_start 要求基准日 S 的索引 i ≥ 70（即含
 # 前 3 位与旧版完全一致，旧缓存（3 元组）仍可读；后 4 位旧缓存没有，为 None。
 # 保留前 3 位是为了不重写 116MB 历史缓存，同时让新数据能支持 ATR/收盘位置/成交额。
 BAR_ORDER = "date,close,volume,open,high,low,amount"
+
+
+def bar_at(bar, idx):
+    """安全读取 bar 的第 idx 位（v3.5）。
+
+    ⚠️ database/kline_*.json 里既有 v2.6 前落盘的 3 元组（实测占多数），
+    也有 7 元组。对 3 元组取 open/high/low/amount 会 IndexError，因此任何
+    新增的 OHLC 过滤都必须走本函数，否则会在历史缓存上静默失效或直接崩。
+    """
+    return bar[idx] if len(bar) > idx else None
+
+
+def bar_low(bar):
+    return bar_at(bar, 5)
+
+
+def bar_high(bar):
+    return bar_at(bar, 4)
+
 
 # ⚠️ CROSS_TPL 一旦改动，必须同时把 CROSS_CACHE_VERSION +1。
 #    否则旧 cross_*.json 会被当成当前表达式的结果复用（服务端字段随表达式来去）。
@@ -305,19 +333,38 @@ def jdump(path, obj):
 
 # ---------------- 数据获取（含落盘） ----------------
 
-def get_trading_days(end, refresh, span="2026-06-01"):
-    """单文件缓存；已覆盖到 end 就直接复用，避免每天生成新文件"""
+CAL_LIMIT = 2000            # 交易日历单次返回上限（防御性，超过即报错而非静默截断）
+CAL_SPAN_DAYS = 365 * 4     # 默认回看 4 年（≈970 个交易日），覆盖回测区间
+
+
+def get_trading_days(end, refresh, span=None):
+    """交易日列表（单文件缓存）。
+
+    v3.5：起点动态化。原实现写死 span="2026-06-01" + --limit 500：到约 2028 年中
+    累计交易日超过 500 后，返回会被截断，days[-1] 永久停在截断处，而 main() 里
+    S = days[-1] 既不报错也不告警，会静默用过期基准日跑出一份看似正常的名单。
+    """
+    e = dt.date.fromisoformat(end)
+    auto = (e - dt.timedelta(days=CAL_SPAN_DAYS)).isoformat()
+    span = auto if span is None else min(span, auto)
     path = os.path.join(DB, "trading_calendar.json")
     cached = jload(path, {})
-    if not refresh and cached.get("end") == end and cached.get("days"):
-        return cached["days"]
+    if (not refresh and cached.get("end") == end and cached.get("days")
+            and cached.get("span") == span):
+        return [d for d in cached["days"] if d <= end]
     rows = retry(lambda: md(run([W, "trade-calendar", "--start", span, "--end", end,
-                                 "--trading-only", "--limit", "500"])),
+                                 "--trading-only", "--limit", str(CAL_LIMIT)])),
                  what="交易日历")
     if rows is None:
         raise RuntimeError("交易日历获取失败，终止")
+    if len(rows) >= CAL_LIMIT:
+        raise RuntimeError(
+            f"交易日历返回 {len(rows)} 条，已达上限 {CAL_LIMIT}，结果可能被截断；"
+            f"请调大 CAL_LIMIT 或缩短区间（{span} ~ {end}）")
     ds = sorted(r["date"] for r in rows if r.get("date") and r["date"] <= end)
-    jdump(path, {"end": end, "days": ds})
+    if not ds:
+        raise RuntimeError(f"交易日历为空（{span} ~ {end}）")
+    jdump(path, {"end": end, "span": span, "days": ds})
     return ds
 
 
@@ -325,7 +372,9 @@ def get_cross(day, lo, hi, refresh):
     """横截面粗筛，逐日单独落盘。
 
     v2.6：缓存带签名（表达式 + lo/hi + 版本）。改 --chg-lo/--chg-hi 或 CROSS_TPL
-    后不会再复用旧结果；旧版无 meta 的缓存仅在「默认参数 + 版本 1」时迁移一次。
+    后不会再复用旧结果。
+    v2.7 起：无 meta 的旧缓存**不再迁移**，一律按新签名重拉（此前「默认参数 + 版本1
+    时迁移一次」的写法已废弃，注释曾漏改，v3.5 更正）。
     空结果仍视为失败：历史日期接口会静默返空，不能把失败当成「当天 0 只」。
     """
     path = os.path.join(DB, f"cross_{day}.json")
@@ -526,6 +575,42 @@ def get_quotes(codes, day, refresh):
     return out
 
 
+def get_mv(day, refresh):
+    """某交易日的全市场流通/总市值（**元**），格式 {code: [流通, 总]}。
+
+    v3.5（P1-3）：市值比的分母必须与分子（d* 日 MainNetFlow）同一天。
+    原实现用 `quote --date S` 的流通市值，age=4 时分母滞后 4 个交易日，
+    小盘股市值一周波动可达 10%+，足以让 0.2% 的阈值翻转。
+
+    与 download_history.download_mv() 使用同一文件名与同一格式，两个程序共用缓存。
+    """
+    path = os.path.join(DB, f"mv_{day}.json")
+    if os.path.exists(path) and not refresh:
+        cached = jload(path, {})
+        if cached:
+            return cached
+    rows = retry(lambda: md(run([W, "screen", "condition", "--expression",
+                                 "intersect([NegotiableMV > 0, TotalMV > 0])",
+                                 "--date", day, "--limit", "8000"])),
+                 what=f"市值快照 {day}")
+    if rows is None:
+        raise RuntimeError(
+            f"市值快照失败：{day}。市值比分母无法计算，"
+            f"终止以免产出不可信名单（可重跑或加 --refresh）")
+    out = {}
+    for r in rows:
+        c = r.get("code")
+        try:
+            out[c] = [float(r["NegotiableMV"]), float(r["TotalMV"])]
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not out:
+        raise RuntimeError(f"市值快照为空：{day}（接口未返回 NegotiableMV/TotalMV）")
+    jdump(path, out)
+    time.sleep(0.5)
+    return out
+
+
 # ---------------- 成长基因标注（独立于上面的裁决） ----------------
 
 def _westock_module():
@@ -591,6 +676,9 @@ def fin_retry(fn, tries=TURN_FIN_RETRIES, what=""):
 
     通用 retry() 的 1.5s 节奏对 data_finance 不够；实测限频后要等 10s 以上
     才恢复，否则越试越糟。返回 None 表示彻底失败。
+
+    v3.5：不再靠匹配中文「限频」决定退避长度——服务端换文案就会退化成 3s 短退避。
+    现在**任何失败**都按指数退避，且下限不低于 TURN_FIN_BACKOFF（默认 15s）。
     """
     last = None
     for i in range(tries):
@@ -602,7 +690,7 @@ def fin_retry(fn, tries=TURN_FIN_RETRIES, what=""):
             last = e
             if i < tries - 1:
                 msg = str(e)
-                wait = TURN_FIN_BACKOFF if "限频" in msg else 3.0 * (i + 1)
+                wait = max(TURN_FIN_BACKOFF, min(60.0, 5.0 * (2 ** i)))
                 sys.stderr.write(
                     f"\n  [重试] {what}：{msg[:70]}，{wait:.0f}s 后重试\n")
                 time.sleep(wait)
@@ -1223,9 +1311,28 @@ def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
 
     health = health_metrics(inc_rows, bal_rows, ratio_rows, day)
 
-    # 银行/保险/券商：没有毛利率、也没有合同负债语义 → 整体「不适用」
+    # 银行/保险/券商：没有毛利率、也没有合同负债语义 → 整体「不适用」。
+    # v3.5：不再用「字段缺失」反推行业（那会把恰好缺字段的普通制造业误标成金融），
+    # 改用接口自带的 EnterpriseType（实测 balance / balancesheet 均返回，income 没有）。
+    # 非金融企业若两个字段都缺 → 记「数据缺失」，与「不适用」区分开。
+    ent = next((r.get("EnterpriseType") for r in bal.values()
+                if r.get("EnterpriseType")), None)
+    is_financial = bool(ent) and ent != "一般企业"
     applicable = gm_applicable or cl_applicable
-    if not applicable:
+    if not applicable and not is_financial:
+        return {"label": "数据缺失", "score": None, "applicable": False,
+                "reason": "；".join(x for x in (why1, why2, why3) if x),
+                "period": t, "gm_text": gm_text, "gm": [g2, g3],
+                "gm_yoy": gm_yoy, "gm_desc": gm_desc,
+                "rev_q": [r2, r3], "rev_ok": bool(rev_ok),
+                "cl_growth": cl_growth, "cl_ratio": cl_ratio,
+                "cl_part": cl_part, "ar_part": ar_part, "cl_desc": cl_desc,
+                "ocf_np_text": ocf_np_text, "ocf_desc": ocf_desc,
+                "ocf_ttm": ocf, "np_ttm": np_, "ocf_prev": ocf_prev,
+                "health": health, "health_label": "数据不足",
+                "health_desc": "毛利率/合同负债字段缺失，四项指标无法判定",
+                "enterprise_type": ent, "p1": False, "p2": False, "p3": False}
+    if not applicable:      # 金融行业：语义上不适用，不是数据问题
         return {"label": "不适用", "score": None, "applicable": False,
                 "reason": "；".join(x for x in (why1, why2, why3) if x),
                 "period": t, "gm_text": gm_text, "gm": [g2, g3],
@@ -1236,8 +1343,8 @@ def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
                 "ocf_np_text": ocf_np_text, "ocf_desc": ocf_desc,
                 "ocf_ttm": ocf, "np_ttm": np_, "ocf_prev": ocf_prev,
                 "health": health, "health_label": "不适用",
-                "health_desc": "金融行业，四项指标不适用",
-                "p1": False, "p2": False, "p3": False}
+                "health_desc": f"金融行业（{ent}），四项指标不适用",
+                "enterprise_type": ent, "p1": False, "p2": False, "p3": False}
 
     score = ((TURN_SCORE_GM if p1 else 0) +
              (TURN_SCORE_CL if p2 else 0) +
@@ -1259,6 +1366,7 @@ def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
             "ocf_np_text": ocf_np_text, "ocf_desc": ocf_desc,
             "health": health, "health_label": health["level"],
             "health_desc": health["desc"],
+            "enterprise_type": ent,
             "p1": bool(p1), "p2": bool(p2), "p3": bool(p3)}
 
 
@@ -1306,6 +1414,14 @@ def find_start(code, name, bars, S):
     if up == 0:
         return None, "未站上 MA20"
     ci = i - (up - 1)
+    # v3.5（P1-4）：回扫最多到索引 20（i≥70 时约 51 天），若股票连续更久站在
+    # MA20 上方，ci 会停在回扫边界而不是真正的上穿日。规则文档 §2.1 ① 要求
+    # 「收(d*−1) ≤ MA20(d*−1) 且 收(d*) > MA20(d*)」，这里补齐前半句的断言。
+    # 正常回扫停下时 cl[ci-1] 必然 ≤ MA20(ci-1)；只有触及边界才会不满足。
+    if ci > 0:
+        mprev = ma(cl, 20, ci - 1)
+        if mprev is not None and cl[ci - 1] > mprev:
+            return None, "非真上穿（连续站上 MA20 超过回扫上限）"
     return {"code": code, "name": name, "d_star": bars[ci][0], "age": i - ci,
             "close": cl[i], "ma20": ma(cl, 20, i), "ma60": ma(cl, 60, i),
             "cl_s": cl[ci], "m20s": ma(cl, 20, ci), "m60s": ma(cl, 60, ci),
@@ -1322,7 +1438,12 @@ def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
         return False, f"⑦ 距启动{det['age']}日 > N={N}"
     if det["vcross"] < k_vol:
         return False, f"② 启动日放量不足({det['vcross']:.2f}<{k_vol})"
-    row0 = cross_by_day.get(d0, {}).get(c)
+    # v3.5（P3）：age 是「该股自己的 K 线索引差」，不是市场交易日差。若窗口内
+    # 停牌，d* 的实际日期可能早于 need[0]，而 cross_by_day 只覆盖 need → 这里
+    # 会被误记为「日频条件不通过」。单独给一个原因，避免污染追溯信息。
+    if d0 not in cross_by_day:
+        return False, f"③ 启动日({d0})不在本次覆盖窗口（该股存在停牌）"
+    row0 = cross_by_day[d0].get(c)
     if row0 is None:
         return False, f"③ 启动日({d0})未通过日频条件"
     # v2.6 P0：服务端条件必须在本地复核。否则缓存参数不一致/字段缺失时，
@@ -1360,6 +1481,16 @@ def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
         return False, "⑤ ST"
     if c in new_by_day.get(d0, set()):
         return False, "⑤ 次新（未满3年）"
+    # v3.5（P1-2）：d* 当天不是 ST/次新，不代表 S 日也不是。S 一定在 need 里，
+    # 这两个集合已取到，复检成本为零；否则「d* 之后被 ST」的股票仍会入选。
+    if c in st_by_day.get(S, set()):
+        return False, "⑤ S日 ST"
+    if c in new_by_day.get(S, set()):
+        return False, "⑤ S日 次新（未满3年）"
+    # ⑥「启动后未跌破 MA20」是**定义性条件**（规则文档 §2.2）：d* 的定位方式
+    # 保证 [ci, i] 每天都在 MA20 上方，所以本循环恒不触发、剔除数恒为 0。
+    # 保留它只作防御性断言，不是独立风控；真正想防的「回踩破启动日低点」需先
+    # 重下带 OHLC 的历史 K 线（旧缓存是 3 元组，见 bar_at 注释）。
     for j in range(det["_ci"] + 1, det["_i"] + 1):
         m = ma(cl, 20, j)
         if not m or cl[j] <= m:
@@ -1370,7 +1501,7 @@ def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
 # ---------------- 主流程 ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="K线选股规则 v3.4（每周选股，K=5）")
+    ap = argparse.ArgumentParser(description="K线选股规则 v3.5（每周选股，K=5）")
     ap.add_argument("--date", help="基准交易日（默认最近交易日）")
     ap.add_argument("--n", type=int, default=4,
                     help="新鲜度窗口，必须 = 扫描周期−1（每周 K=5 用 4=默认；"
@@ -1386,6 +1517,12 @@ def main():
 
     if not os.path.exists(W):
         print(f"错误：找不到 westock CLI（{W}）", file=sys.stderr)
+        return 1
+    # v3.5：--n 无合法性校验时，--n -1 会让 need = hist[0:]（整段历史），
+    # 且 judge 的 age > N 恒真 → 全体被静默剔除，看起来像「今天没有合格股」。
+    if a.n < 0:
+        print(f"错误：--n 必须 ≥ 0（当前 {a.n}）；每周用 4、每 3 日用 2、每日用 0",
+              file=sys.stderr)
         return 1
     os.makedirs(DB, exist_ok=True)
     os.makedirs(CSVDIR, exist_ok=True)
@@ -1436,6 +1573,16 @@ def main():
             f"横截面字段缺失 {len(bad_fields)} 处（如 {d} {c} {k}）。"
             f"请检查 CROSS_TPL 是否仍引用这些字段，或加 --refresh 重建缓存。")
 
+    # v3.5：CHG_HI=20.5% 只覆盖主板 10% 与创业板/科创板 20% 涨停。北交所是 30%
+    # 涨跌幅，一旦服务端把 bj 纳入粗筛结果，20.5% 上限会**方向相反地**砍掉
+    # 20.5%~30% 的强势启动。当前 cross 缓存里 bj 代码数为 0，先做告警。
+    bj_n = sum(1 for d in need for c in cross_by_day[d]
+               if str(c).startswith("bj"))
+    if bj_n:
+        sys.stderr.write(
+            f"      ⚠️ 粗筛池出现 {bj_n} 个北交所代码（bj*）：当前 --chg-hi="
+            f"{a.chg_hi}% 不覆盖北交所 30% 涨跌幅，请改用 --chg-hi 30.5\n")
+
     print("[3/6] 排除集（ST + 次新分桶）...", flush=True)
     st_by_day, new_by_day = {}, {}
     for d in need:
@@ -1483,7 +1630,7 @@ def main():
 
     print("[6/6] 取行情 / 计算市值比 / 写结果 ...", flush=True)
     q = get_quotes([x["code"] for x in hit], S, a.refresh) if hit else {}
-    # ⚠️ 行情缺失会让「市值比」算不出来；绝不能因此静默剔除（会悄悄丢掉合格股票）
+    # ⚠️ 行情快照缺失会让 PE/PB/换手 等展示列空白；绝不能因此静默剔除。
     if hit:
         missing = [x["code"] for x in hit
                    if not cap_to_yuan(fnum((q.get(x["code"]) or {})
@@ -1491,7 +1638,7 @@ def main():
         if missing:
             raise RuntimeError(
                 f"行情数据缺失 {len(missing)}/{len(hit)} 只（如 {missing[:5]}）。"
-                f"市值比无法计算，终止以免产出不可信名单。"
+                f"展示列（PE/PB/换手）无法填充，终止以免产出不可信名单。"
                 f"可重跑一次或加 --refresh。")
     # ⚠️ 同上一道防线，但针对「启动日净流入」字段：字段缺失时市值比同样算不出来。
     #    典型成因是 CROSS_TPL 不再引用 MainNetFlow —— 服务端只返回被引用的列，
@@ -1507,6 +1654,24 @@ def main():
                 f"市值比无法计算，终止以免产出不可信名单。"
                 f"请检查 CROSS_TPL 是否仍引用 MainNetFlow"
                 f"（服务端只返回表达式引用到的列）。")
+
+    # v3.5（P1-3）：市值比的分母改用 **d* 日**流通市值，与分子 MainNetFlow@d* 同日。
+    # 原实现用 `quote --date S`，age=4 时分母滞后 4 个交易日，小盘股市值一周波动
+    # 可达 10%+，足以让 0.2% 的阈值翻转。mv_<d>.json 与 download_history 共用。
+    mv_by_day = {}
+    if hit:
+        d_star_days = sorted({x["d_star"] for x in hit})
+        print(f"      市值比口径：分子/分母同为 d* 日（{len(d_star_days)} 个日期："
+              f"{', '.join(d_star_days)}）", flush=True)
+        for d in d_star_days:
+            mv_by_day[d] = get_mv(d, a.refresh)
+        lack = [f"{x['code']}@{x['d_star']}" for x in hit
+                if not ((mv_by_day.get(x["d_star"]) or {})
+                        .get(x["code"]) or [None])[0]]
+        if lack:
+            raise RuntimeError(
+                f"启动日流通市值缺失 {len(lack)}/{len(hit)} 只（如 {lack[:5]}）。"
+                f"市值比无法计算，终止以免产出不可信名单（可重跑或加 --refresh）。")
     final, rej2 = [], {}
     for x in hit:
         r = q.get(x["code"], {})
@@ -1516,8 +1681,10 @@ def main():
         nf = fnum(cross_by_day[x["d_star"]][x["code"]].get("MainNetFlow"))
         nf5 = fnum(cross_by_day[x["d_star"]][x["code"]].get("MainNetFlow5D"))
         chg = fnum(cross_by_day[x["d_star"]][x["code"]].get("ChangePCT"))
-        fc = cap_to_yuan(num("circulating_market_cap"))
-        tc = cap_to_yuan(num("total_market_cap"))
+        # 分母 = d* 日流通市值（元）；mv 文件里已经是元，不再过 cap_to_yuan
+        pair = mv_by_day[x["d_star"]][x["code"]]
+        fc = float(pair[0])
+        tc = float(pair[1]) if pair[1] else None
         ratio = nf / fc * 100 if (nf is not None and fc) else None
         if a.flow_ratio > 0 and (ratio is None or ratio < a.flow_ratio):
             rej2[f"③ 启动日市值比 < {a.flow_ratio}%"] = \
@@ -1526,11 +1693,13 @@ def main():
         x.update({
             "chg": chg, "net_flow": nf, "net_flow_5d": nf5,
             "flow_ratio": round(ratio, 3) if ratio is not None else None,
+            "flow_cap_day": x["d_star"],
             "r20": round(x["close"] / x["ma20"] * 100 - 100, 2),
             "r60": round(x["close"] / x["ma60"] * 100 - 100, 2),
             "m20_m60": round(x["ma20"] / x["ma60"], 4),
             "float_cap_yi": round(fc / 1e8, 2) if fc else None,
-            "total_cap_yi": round(tc / 1e8, 2) if tc else None,
+            "total_cap_yi": round(tc / 1e8, 2) if tc is not None else None,
+            "close_cap_day": cap_to_yuan(num("circulating_market_cap")),
             "pe": num("pe_ratio"), "pb": num("pb_ratio"),
             "turnover": num("turnover_rate"),
         })
@@ -1605,7 +1774,8 @@ def main():
         else:
             x["health_text"] = ""
     if turn is not None and final:
-        order = ["是", "部分", "否", "无数据", "不适用"]
+        # v3.5：新增「数据缺失」——与「不适用（金融行业）」区分开
+        order = ["是", "部分", "否", "无数据", "数据缺失", "不适用"]
         cnt = {k: 0 for k in order}
         for x in final:
             cnt[x["turn_label"]] = cnt.get(x["turn_label"], 0) + 1
@@ -1636,12 +1806,17 @@ def main():
             ])
 
     # ---- 写运行明细（便于追溯）----
-    result = {"基准日": S, "扫描周期K": a.n + 1, "新鲜度窗口N": a.n,
+    result = {"版本": "v3.5",
+              "基准日": S, "扫描周期K": a.n + 1, "新鲜度窗口N": a.n,
               "覆盖区间": need,
               "参数": {"K_VOL": a.k_vol, "涨幅区间": [a.chg_lo, a.chg_hi],
                        "市值比下限": a.flow_ratio, "MA60上限": a.ma60_gap,
                        "C2容忍": C2_TOL, "C3比例": C3_RATIO,
-                       "上市满年数": LISTED_YEARS},
+                       # v3.5：删除假参数「上市满年数」，改为写明真实口径
+                       "次新股口径": "服务端标签四桶并集"
+                                     "（listeddate_5days/3mons/1year/3year）",
+                       "市值比分母": "d* 日流通市值（与分子同日）",
+                       "市值比分母来源": "mv_<d*>.json（screen condition NegotiableMV）"},
               "基因标注参数": {"单季EPS同比下限%": GENE_EPS_Q_YOY_MIN,
                                "三年EPS_CAGR下限%": GENE_EPS_CAGR3_MIN,
                                "最新年报ROE下限%": GENE_ROE_MIN,

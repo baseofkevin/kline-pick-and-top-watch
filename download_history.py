@@ -36,6 +36,7 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -89,13 +90,17 @@ def md(txt):
     return out
 
 
-def retry(fn, what, tries=RETRIES, backoff=(5, 15, 30, 60)):
+def retry(fn, what, tries=RETRIES, backoff=(5, 15, 30, 60), allow_empty=False):
     """返回 None 表示彻底失败（调用方必须处理，不得静默继续）
-    退避必须够长：实测瞬时故障可持续数秒，1.5/3/4.5s 的短退避扛不过去。"""
+    退避必须够长：实测瞬时故障可持续数秒，1.5/3/4.5s 的短退避扛不过去。
+
+    allow_empty=True 时，空结果视为**成功但为空**（只用于「空结果本身合法」的
+    场景，如标签分页的第 2 页起）；默认 False，因为历史日期接口会把失败静默
+    表现为空列表。本参数与 screen_kline.retry() 保持同一语义（v3.5）。"""
     for i in range(tries):
         try:
             r = fn()
-            if r:
+            if r or (allow_empty and r is not None):
                 return r
         except Exception:
             pass
@@ -186,7 +191,10 @@ def download_labels(days, refresh):
                 rows = retry(lambda: md(run([W, "screen", "label", "--type", L,
                                              "--date", d, "--limit", str(LABEL_PAGE),
                                              "--offset", str(off)])),
-                             what=f"标签 {L} @ {d}")
+                             what=f"标签 {L} @ {d}",
+                             # v3.5：第 2 页起空页是「分页正常结束」，必须是成功；
+                             # 否则某桶数量恰为 LABEL_PAGE 整数倍时会误判失败并中止整次下载。
+                             allow_empty=(off > 0))
                 if rows is None:
                     raise RuntimeError(f"排除集拉取失败：{L} @ {d}（不得留下残缺数据）")
                 (st if L == "risk_st" else new).update(
@@ -388,9 +396,13 @@ def main():
     if a.kline_only:
         print("\n[--kline-only] 跳过横截面 / 标签 / 市值，只补 K 线")
         # 从已有 cross 文件重建候选并集，避免重复遍历
+        # v3.5：必须只认 cross_<YYYY-MM-DD>.json。原 glob 会同时匹配到
+        # v2.6 引入的 cross_<d>.meta.json（签名文件），days 里混入
+        # "2026-10-19.meta"，随后把 meta 的 dict 当 list 遍历 → AttributeError。
         import glob
-        days = sorted(set(os.path.basename(f)[6:-5]
-                          for f in glob.glob(os.path.join(DB, "cross_*.json"))))
+        days = sorted({m.group(1) for f in glob.glob(os.path.join(DB, "cross_*.json"))
+                       if (m := re.match(r"cross_(\d{4}-\d{2}-\d{2})\.json$",
+                                         os.path.basename(f)))})
         if not days:
             print("错误：database/ 下没有 cross_*.json，无法确定候选并集", file=sys.stderr)
             return 1
@@ -407,8 +419,13 @@ def main():
     # 候选并集（供 K 线一次性拉取）
     pool = set()
     for d in days:
-        for r in jload(os.path.join(DB, f"cross_{d}.json"), []):
-            if r.get("code"):
+        rows = jload(os.path.join(DB, f"cross_{d}.json"), [])
+        if not isinstance(rows, list):      # v3.5：非 list 直接跳过，不再 AttributeError
+            print(f"  [跳过] cross_{d}.json 不是列表（疑似损坏/非粗筛文件）",
+                  file=sys.stderr)
+            continue
+        for r in rows:
+            if isinstance(r, dict) and r.get("code"):
                 pool.add(r["code"])
     pool = sorted(pool)
     print(f"\n[4/5] 候选并集 {len(pool)} 只（跨 {len(days)} 个交易日）")

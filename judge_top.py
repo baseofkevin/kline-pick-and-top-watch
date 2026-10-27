@@ -39,6 +39,14 @@ judge_top.py —— 单只股票「四因子独立观察」（不合并总分，
 
 ⚠️ 边界：
     本程序不预测精确最高点，也不构成买卖指令。
+
+v3.5（2026-10-27）：
+    · 删除从未被输出层使用的评分链路（WEIGHTS/SCORE_TABLE/PCT_TABLE 与
+      evaluate() 里的 total/verdict/summary/position/completeness/drivers），
+      对外输出不变；
+    · 920xxx 归一化为北交所 bj（原先落到 sh920xxx）；
+    · 3 年 K 线任一段拉取失败时直接报错，不再静默留下整年空洞；
+    · 缺 high/last 字段时给出专用报错，不再报成「K 线不足 30 根」。
 """
 
 import argparse
@@ -67,62 +75,14 @@ def log(msg):
     if not QUIET:
         print(msg, file=LOG_STREAM, flush=True)
 
-# ---------------- 权重（合计 100%） ----------------
-W_RET5 = 0.05
-W_RET20 = 0.20
-W_RET60 = 0.12
-W_POS250 = 0.08
-W_AVG20 = 0.20
-W_STD20 = 0.08
-W_RATIO = 0.12
-W_ACCEL = 0.15
+# ---------------- 运行参数 ----------------
 FIN_NUM = 60  # 20 期只能覆盖约 5 年，历史分析会缺上一季
 
-WEIGHTS = {
-    "RET5": W_RET5, "RET20": W_RET20, "RET60": W_RET60, "POS250": W_POS250,
-    "AVG20": W_AVG20, "STD20": W_STD20, "RATIO": W_RATIO, "ACCEL": W_ACCEL,
-}
-
-# 绝对阈值（仅历史样本 <60 个时回退；正常评分用自身 250 日分位）
-SCORE_TABLE = {
-    "RET5":  [(0.20, 100), (0.12, 85), (0.08, 65), (0.04, 45), (0.00, 30)],
-    "RET20": [(0.50, 100), (0.30, 85), (0.20, 70), (0.10, 50), (0.00, 30)],
-    "RET60": [(1.00, 100), (0.60, 85), (0.40, 70), (0.20, 50), (0.00, 30)],
-    "POS250": [(-0.005, 100), (-0.02, 85), (-0.05, 70), (-0.10, 50), (-0.20, 30)],
-    "AVG20": [(15.0, 100), (10.0, 85), (8.0, 70), (5.0, 50), (3.0, 35)],
-    "STD20": [(5.0, 100), (4.0, 85), (3.0, 70), (2.0, 50), (1.0, 30)],
-    "RATIO": [(2.5, 100), (2.0, 85), (1.5, 70), (1.2, 50), (1.0, 35)],
-}
-
-# 相对分位对应的标签（P95/P90/P75/P50/P25/更低）
-PCT_LABELS = {
-    "RET5": ["短线极热", "短线很热", "短线偏热", "短线中性", "短线偏冷", "短线冷"],
-    "RET20": ["20日极热", "20日很热", "20日偏热", "20日中性", "20日偏冷", "20日冷"],
-    "RET60": ["60日极热", "60日很热", "60日偏热", "60日中性", "60日偏冷", "60日冷"],
-    "POS250": ["贴近250日高点", "距高点很近", "高位", "中位",
-               "偏低", "深度回撤"],
-    "AVG20": ["换手极高", "换手很高", "换手偏高", "换手中等",
-              "换手偏低", "换手低"],
-    "STD20": ["换手极不稳定", "换手很不稳定", "换手不稳定", "换手中等",
-              "换手较稳", "换手稳定"],
-    "RATIO": ["换手显著放大", "换手明显放大", "换手放大", "换手中等",
-              "换手收缩", "换手明显收缩"],
-}
-
-LABELS = {
-    "RET5": ["短线极热", "短线过热", "短线偏热", "短线偏强", "短线平", "短线弱"],
-    "RET20": ["20日极热", "20日过热", "20日偏热", "20日偏强", "20日平", "20日弱"],
-    "RET60": ["60日极热", "60日过热", "60日偏热", "60日偏强", "60日平", "60日弱"],
-    "POS250": ["贴近250日高点", "距高点很近", "高位", "高位小幅回落",
-               "明显回落", "深度回落"],
-    "AVG20": ["换手极高", "换手很高", "换手偏高", "换手偏高", "换手正常", "换手低"],
-    "STD20": ["换手极不稳定", "换手很不稳定", "换手不稳定", "换手偏乱",
-              "换手较稳", "换手稳定"],
-    "RATIO": ["换手显著放大", "换手明显放大", "换手放大", "换手略放大",
-              "换手平稳", "换手收缩"],
-    "ACCEL": ["业绩大幅减速", "业绩明显减速", "业绩减速", "业绩平稳",
-              "业绩加速", "业绩强加速"],
-}
+# v3.5：删除 WEIGHTS / SCORE_TABLE / PCT_TABLE / PCT_LABELS / LABELS 以及
+# table_score / percentile_score / score_factor / accel_score。
+# 它们只服务于一条「合并总分 → 判顶」的旧链路，与「四因子独立观察、不合并
+# 总分、不自动判断顶部」的设计原则相悖；而该链路的结果从未被 print_report /
+# HTML 使用（只写进 result 再被过滤掉），属于纯残留。
 
 
 # ---------------- 数据访问 ----------------
@@ -194,6 +154,7 @@ def fetch_kline(wk, code, end, refresh):
     log(f"[数据] 拉取日K：{code}，向前 3 年，分 3 段")
     ed = dt.date.fromisoformat(end)
     merged = {}
+    failed = []
     for i in range(3):
         ce = ed - dt.timedelta(days=365 * i)
         cs = ce - dt.timedelta(days=365)
@@ -202,11 +163,23 @@ def fetch_kline(wk, code, end, refresh):
             "period": "day", "limit": 300, "fq": "qfq"})
         if d is None:
             sys.stderr.write(f"  [告警] K线第 {i + 1} 段获取失败\n")
+            failed.append(i + 1)
             continue
         for x in _nodes(d):
             if x.get("date"):
                 merged[x["date"]] = x
         time.sleep(0.2)
+
+    # v3.5：缺任何一段都会在合并序列里留下一个整年的空洞，而 cl 是连续列表——
+    # ret60 名义上 60 个交易日、实际可能跨 300 多个自然日，250 日高点/分位全失效，
+    # 且下游没有任何提示。这里直接报错（不写缓存，下次重跑会重新拉）。
+    if failed and merged:
+        raise RuntimeError(
+            f"{code} 的日K第 {failed} 段获取失败：序列存在空洞，"
+            f"短期/位置类指标会失真，拒绝计算（请重跑或加 --refresh）")
+    if failed:
+        # 全段失败：交给下游「无 K 线/不足 30 根」的统一报错
+        sys.stderr.write(f"  [告警] {code} 日K 3 段全部获取失败\n")
 
     if merged:
         ks = sorted(merged)
@@ -292,6 +265,10 @@ def kline_metrics(nodes):
     cl = [fnum(x.get("last")) for x in nodes]
     hi = [fnum(x.get("high")) for x in nodes]
     if any(v is None for v in cl):
+        return None
+    # v3.5：hi 与 cl 必须同样防 None。原来只在 cl 上判，缺 high 时
+    # rolling_max() 的比较和 high_stats() 的 max(key=...) 都会抛 TypeError。
+    if any(v is None for v in hi):
         return None
     tv = [fnum(x.get("exchange")) for x in nodes]
     pv = [fnum(x.get("volume")) for x in nodes]
@@ -607,64 +584,10 @@ def fin_metrics(rows, end):
     }
 
 
-# ---------------- 评分 ----------------
-
-def table_score(kind, x):
-    """按 SCORE_TABLE 从高到低匹配；返回 (score, label)。"""
-    if x is None:
-        return 50.0, "数据不足"
-    table = SCORE_TABLE[kind]
-    labels = LABELS[kind]
-    for i, (th, sc) in enumerate(table):
-        if x >= th:
-            return float(sc), labels[i]
-    return float(table[-1][1] - 15), labels[-1]
-
-
-# 自身历史分位 -> 得分；P50 映射到 40，避免中性股票被总分阈值误判
-PCT_TABLE = [
-    (95.0, 100), (90.0, 85), (75.0, 65),
-    (50.0, 40), (25.0, 25), (0.0, 15),
-]
-
-
-def percentile_score(kind, pct):
-    """把自身历史分位映射成 20~100 分；越高越偏顶部风险。"""
-    if pct is None:
-        return None, None
-    labels = PCT_LABELS.get(kind, LABELS[kind])
-    for i, (th, sc) in enumerate(PCT_TABLE):
-        if pct >= th:
-            return float(sc), labels[i]
-    return 20.0, labels[-1]
-
-
-def score_factor(kind, x, pct):
-    """有历史分位就用相对分位；样本不足回退到绝对阈值。"""
-    if pct is not None:
-        return percentile_score(kind, pct)
-    return table_score(kind, x)
-
-
-def accel_score(fm):
-    """业绩加速度：越低（越减速）分数越高；正加速反而降低顶部风险。"""
-    if not fm or fm.get("accel") is None:
-        return 50.0, "业绩数据不足"
-    if fm.get("profit") is not None and fm["profit"] <= 0:
-        return 50.0, "盈利为负，仅参考"
-    a = fm["accel"]
-    labels = LABELS["ACCEL"]
-    if a <= -0.50:
-        return 100.0, labels[0]
-    if a <= -0.30:
-        return 85.0, labels[1]
-    if a <= -0.10:
-        return 65.0, labels[2]
-    if a <= 0.10:
-        return 50.0, labels[3]
-    if a <= 0.30:
-        return 30.0, labels[4]
-    return 15.0, labels[5]
+# ---------------- 评分（v3.5 已整段删除） ----------------
+# 原「四个因子打分 → 加权总分 → 顶部结论」的链路与设计原则冲突，且从未被任何
+# 输出层使用（print_report 不打印、HTML 不渲染、--json 过滤掉）。如未来确实要
+# 恢复「综合评分」，必须同时改 __doc__ / README / --verbose 的「不合并总分」承诺。
 
 
 def fmt_pct(x, signed=True):
@@ -814,6 +737,15 @@ def evaluate(code, end, refresh, with_quote=True):
                     "A股代码示例：sh600519 / sz300750")
             raise RuntimeError(
                 f"{code} 当前无 K 线（可能停牌），无法计算短期因子")
+        # v3.5：区分「根数不足」与「字段缺失」，否则缺 high 会报成「K线仅 725 根」
+        if any(fnum(x.get("high")) is None for x in nodes):
+            raise RuntimeError(
+                f"{code} 的日K缺少 high 字段（{len(nodes)} 根中有空值），"
+                "无法计算 250 日高点与位置分位；请加 --refresh 重拉")
+        if any(fnum(x.get("last")) is None for x in nodes):
+            raise RuntimeError(
+                f"{code} 的日K缺少 last（收盘）字段，无法计算短期因子；"
+                "请加 --refresh 重拉")
         raise RuntimeError(
             f"{code} 的 K 线仅 {len(nodes)} 根，至少需要 30 根（约 6 周）"
             "才能计算短期因子；新股/次新股暂不适用")
@@ -844,20 +776,8 @@ def evaluate(code, end, refresh, with_quote=True):
         if isinstance(q, dict):
             quote = q.get(code) or {}
 
-    # 各项得分
-    pct = km.get("pct") or {}
-    s_ret5, l_ret5 = score_factor("RET5", km["ret5"], pct.get("RET5"))
-    s_ret20, l_ret20 = score_factor("RET20", km["ret20"], pct.get("RET20"))
-    s_ret60, l_ret60 = score_factor("RET60", km["ret60"], pct.get("RET60"))
-    s_pos, l_pos = score_factor("POS250", km["pos250"], pct.get("POS250"))
-    s_av20, l_av20 = score_factor("AVG20", km["av20"], pct.get("AVG20"))
-    s_std, l_std = score_factor("STD20", km["std20"], pct.get("STD20"))
-    s_ratio, l_ratio = score_factor("RATIO", km["ratio"], pct.get("RATIO"))
-    fallback = [k for k in ("RET5", "RET20", "RET60", "POS250",
-                            "AVG20", "STD20", "RATIO")
-                if pct.get(k) is None]
-    score_mode = "relative" if not fallback else "mixed"
-    s_accel, l_accel = accel_score(fm)
+    # v3.5：不再给四个因子打分、不再算加权总分、不再产出 verdict/summary/position。
+    # 该链路的结果从未被任何输出层使用，且与「不合并总分、不判断顶部」的设计冲突。
     ej = earnings_judgement(fm)
     qj = qoq_judgement(fm)
     if fm:
@@ -871,75 +791,7 @@ def evaluate(code, end, refresh, with_quote=True):
     else:
         log("[业绩] 无可用财务数据，业绩卡片不判断")
 
-    items = [
-        ("价格", "RET5", "5日涨幅", km["ret5"], s_ret5, l_ret5, fmt_pct(km["ret5"])),
-        ("价格", "RET20", "20日涨幅", km["ret20"], s_ret20, l_ret20, fmt_pct(km["ret20"])),
-        ("价格", "RET60", "60日涨幅", km["ret60"], s_ret60, l_ret60, fmt_pct(km["ret60"])),
-        ("价格", "POS250", "距250日高点", km["pos250"], s_pos, l_pos, fmt_pct(km["pos250"])),
-        ("换手", "AVG20", "20日均换手", km["av20"], s_av20, l_av20,
-         f"{km['av20']:.2f}%" if km["av20"] is not None else "—"),
-        ("换手", "STD20", "20日换手标准差", km["std20"], s_std, l_std,
-         f"{km['std20']:.2f}" if km["std20"] is not None else "—"),
-        ("换手", "RATIO", "1月/1年换手比", km["ratio"], s_ratio, l_ratio,
-         f"{km['ratio']:.2f}" if km["ratio"] is not None else "—"),
-        ("业绩", "ACCEL", "单季盈利加速度", fm["accel"] if fm else None,
-         s_accel, l_accel,
-         fmt_pct_frac(fm.get('accel')) if fm and fm.get("accel") is not None else "—"),
-    ]
-
-    total = 0.0
-    for _, key, _, _, sc, _, _ in items:
-        total += sc * WEIGHTS[key]
-
     pos = km["pos250"]
-    if pos is not None and pos <= -0.20:
-        if phase == "历史顶已过，当前反弹接近局部高点":
-            verdict = "历史顶已过，当前反弹接近局部高点"
-            summary = (f"当前价仍低于 250 日高点（{km['high250_date']}）"
-                       f"{abs(pos) * 100:.1f}%，不是新的历史顶；但已接近 60 日"
-                       "局部高点（或处于反弹高位），追高的短期风险在上升。")
-        else:
-            verdict = "顶部大概率已过"
-            summary = (f"当前价已低于 250 日高点（{km['high250_date']}）20% 以上，"
-                       "历史最高点大概率已经出现；当前更可能处于回撤/震荡，"
-                       "而不是新的顶部。")
-    elif total >= 75:
-        verdict = "已进入顶部高风险区"
-        summary = ("多项过热指标共振，当前处于顶部高风险区；"
-                   "但无法保证这就是精确最高点，需结合是否跌破 MA20 确认。")
-    elif total >= 60:
-        verdict = "顶部风险偏高"
-        summary = "高位特征较明显，追高性价比低，需警惕放量滞涨或跌破短期均线。"
-    elif total >= 45:
-        verdict = "高位震荡，未见确认"
-        summary = "有一定高位特征，但尚未形成多因子共振，继续观察量价是否背离。"
-    else:
-        verdict = "未见明确顶部信号"
-        summary = "当前过热程度不高，或已充分调整；顶部风险偏低。"
-
-    if pos is None:
-        position = "数据不足"
-    elif pos >= -0.05:
-        position = "高位区（距250日高点<5%）"
-    elif pos >= -0.10:
-        position = "高位小幅回落（5%~10%）"
-    elif pos >= -0.20:
-        position = "明显回落（10%~20%）"
-    else:
-        position = "深度回落（>20%）"
-
-    completeness = 40
-    if km["bars"] >= 250:
-        completeness += 25
-    if km["ratio"] is not None:
-        completeness += 15
-    if km["std20"] is not None:
-        completeness += 10
-    if fm and fm.get("accel") is not None:
-        completeness += 10
-
-    drivers = sorted(items, key=lambda x: -x[4] * WEIGHTS[x[1]])[:3]
-    driver_txt = "、".join(f"{d[2]}（{d[4]:.0f}分）" for d in drivers)
 
     warnings = []
     if km["bars"] < 250:
@@ -960,13 +812,7 @@ def evaluate(code, end, refresh, with_quote=True):
         "date": end, "close": km["close"],
         "high250": km["high250"], "high250_date": km["high250_date"],
         "days_since_high": km["days_since_high"], "pos250": pos,
-        "score": round(total, 1), "verdict": verdict,
-        "position": position, "summary": summary,
-        "drivers": driver_txt, "completeness": completeness,
         "phase": phase,
-        "score_mode": score_mode,
-        "percentile": pct,
-        "percentile_n": km.get("pct_n"),
         "local": {
             "pos20": km.get("pos20"), "pos60": km.get("pos60"),
             "pos120": km.get("pos120"),
@@ -979,7 +825,7 @@ def evaluate(code, end, refresh, with_quote=True):
             "vol_stall": km.get("vol_stall"),
             "vol_up": km.get("vol_up"),
         },
-        "items": items, "kline": km, "finance": fm,
+        "kline": km, "finance": fm,
         "quote": quote, "warnings": warnings,
         "earnings": {
             "state": ej["state"], "direction": ej["direction"],
@@ -1699,11 +1545,15 @@ def main(argv=None):
         left, right = code.split(".", 1)
         code = right + left if right in ("sh", "sz", "bj") else left
     if not code.startswith(("sh", "sz", "bj")):
-        if code.startswith(("5", "6", "9")):
+        # v3.5：920xxx 是北交所新代码段，必须排在「9 → sh」之前。
+        # 实测服务端标签里已有 bj920002 … 这类代码，原映射会得到 sh920002。
+        if code.startswith("920"):
+            code = "bj" + code
+        elif code.startswith(("5", "6", "9")):
             code = "sh" + code
         elif code.startswith(("0", "1", "2", "3")):
             code = "sz" + code
-        elif code.startswith(("4", "8")):
+        elif code.startswith(("4", "8")):   # 43/83/87/88 均为北交所
             code = "bj" + code
     end = a.date or dt.date.today().isoformat()
     log(f"[开始] {code}，基准日 {end}")
@@ -1717,11 +1567,9 @@ def main(argv=None):
         return 1
 
     if a.json:
+        # v3.5：评分链路已删除，过滤项相应缩减；kline/finance 仍按原行为保留
         out = {k: v for k, v in r.items()
-               if k not in ("items", "quote", "score", "verdict",
-                            "position", "summary", "drivers", "phase",
-                            "score_mode", "percentile", "percentile_n",
-                            "volume")}
+               if k not in ("quote", "phase", "volume")}
         print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
         sys.stdout.flush()
     elif a.verbose:
