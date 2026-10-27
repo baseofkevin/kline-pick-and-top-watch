@@ -1,0 +1,1 @@
+{"sig": "99b6f979c6d0b231790c8cab2cd60401ece926a2", "version": 2, "expression": "intersect([ChangePCT >= 0.5, ChangePCT <= 20.5, MainNetFlow > 0, MainNetFlow5D > 0, IsDelisted == 0, Ifsuspend == 0])"}

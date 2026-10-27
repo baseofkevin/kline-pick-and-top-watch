@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-K线选股规则 v3.5 —— 每周选股（扫描周期 K = 5 个交易日）
+K线选股规则 v3.8 —— 每周选股（扫描周期 K = 5 个交易日）
 
 规则说明见同目录 K线选股规则_v3.md
-v2 的含义 = 加入了「超级成长股基因」的标注工作（见下），选股参数与裁决条件未变。
 v2.6 为 P0 工程修复；v2.7 为 P1-A 候选池上下限调整（CHG_LO 2.0→0.5、CHG_HI 9.5→20.5）；
-v2.8 把第九节基因口径整体替换为「单季EPS同比 / 三年EPS CAGR / 年报ROE」；
-v2.9 新增「业绩转变」三件套标注（第十节，只标注，不参与裁决）；
+v2.9 新增「业绩转变」标注（第九节，只标注，不参与裁决）；
 v3.0 仅版本号升级（文件名改为 `_v3.md`），规则与 v2.9 相同；
 v3.1 修正 ② 订单代理字段（AdvancePayment→AdvanceReceipts），规模门槛 3%→2%；
 v3.2 新增「财务健康提示」列（现金短债比/净现比/应收增速差/速动比率）；
@@ -17,6 +15,9 @@ v3.5 口径收紧（P1/P2）：①市值比分母改用 d* 日流通市值（与
      ②judge() 补 S 日 ST/次新复检；③find_start() 补「真上穿」断言；
      ④行业「不适用」改用 EnterpriseType 判定，字段缺失另计「数据缺失」；
      ⑤删除假参数 LISTED_YEARS；⑥交易日历起点动态化 + 截断报错。
+v3.6 删除「超级成长基因」标注列及相关代码（原第九节）；选股与裁决条件未变。
+v3.7 业绩转变改为三项独立判断，删除加权总分与「是/部分/否」总标签；选股与裁决条件未变。
+v3.8 CSV 改为精简 12 列，三个判断列把「判断：证据」合并到一格；完整数据仍在 result JSON。
 
 目录结构：
     /home/kevin/MyData/kline-select-stocks-approach/
@@ -29,7 +30,7 @@ v3.5 口径收紧（P1/P2）：①市值比分母改用 d* 日流通市值（与
     │   ├── kline_<起>_<止>.json     候选并集的日K线原始数据
     │   ├── mv_<交易日>.json         全市场流通/总市值 {code: [流通, 总]}（元）
     │   ├── quote_<基准日>.json      最终名单的行情快照
-    │   ├── finance_<基准日>.json    基因标注用的候选股财务历史（利润表）
+    │   ├── finance_<基准日>.json    业绩转变①兜底用的候选股财务历史（利润表）
     │   ├── finance_bal_<基准日>.json    业绩转变②用的资产负债表（合同负债/预收款项）
     │   ├── finance_ratio_<基准日>.json  业绩转变①③用的财务比率总表（单季毛利率/现金流）
     │   └── result_<基准日>.json     本次运行结果与逐条剔除明细（便于追溯）
@@ -44,30 +45,15 @@ v3.5 口径收紧（P1/P2）：①市值比分母改用 d* 日流通市值（与
 
 退出码：0 正常 ｜ 1 出错（含原始数据下载失败）
 
-超级成长基因标注（v2.8，即规则文档第九节）：
-    在已选出的股票后面加一列「超级成长基因」（是/否/无数据），仅作标注，
-    **不筛选、不排序、不影响入选名单**。下列三条同时成立才算「是」：
-      ① 最新单季 EPS 同比增长率 > 30%
-      ② 过去三年 EPS 年均复合增长率 > 25%
-      ③ 最新年报 ROE > 17%
-    口径：
-      · 单季 EPS 由同期累计基本 EPS 差分得到：
-        Q1=一季报；Q2=半年报−一季报；Q3=三季报−半年报；Q4=年报−三季报。
-        同比基期单季 EPS 必须 > 0，否则「同比」没有意义，判「否」。
-      · 三年 CAGR = (最近年报 EPS ÷ 三年前年报 EPS)^(1/3) − 1，
-        两期 EPS 均须 > 0；最近年报为 Y，基期为 Y−3。
-      · ROE 取最新年报加权 ROE（ROEWeighted，缺失时回退 ROE）。
-      · 只认基准日已披露的报告期（InfoPublDate ≤ 基准日），避免未来函数。
-    财务数据获取失败时该列留空（不标「否」），并在 stderr 给出告警；
-    单只股票无财务数据时标「无数据」。二者都不得误读成「已确认没有基因」。
-
-业绩转变标注（v3.2，即规则文档第十节）：
-    在「超级成长基因」之后再加一组「业绩转变」列，同样**只标注**，
-    **不筛选、不排序、不改变入选名单**。三件套（三条同时成立才标「是」）：
+业绩转变标注（v3.8，即规则文档第九节）：
+    在基础行情列之后输出三个判断列，同样**只标注**，
+    **不筛选、不排序、不改变入选名单**。三个指标**各自独立判断**，
+    不合计总分、不合成「是/部分/否」总标签：
       ① 单季毛利率最近 2 个季度严格递增（GM[t-1] < GM[t]），
          且最新一季营收环比不为负，且最新单季 > 上年同季（季节性护栏）；
       ② 合同负债+预收款项 同比 ≥20%，且 ÷ 营业总收入TTM ≥2%；
       ③ 经营现金流TTM >0，且（OCF由负转正 或 归母净利润TTM ≤0 或 OCF/NP >1）。
+    每项取值：是 / 否 / 无数据 / 不适用（金融行业）。
     口径：
       · ① 用 balancesheet 的 GrossIncomeRatio_Q（单季毛利率，%）；缺失时用
         income 的累计营收/成本差分兜底。同比护栏默认开启
@@ -77,11 +63,17 @@ v3.5 口径收紧（P1/P2）：①市值比分母改用 d* 日流通市值（与
         不用年初至今，避免把「Q3 相对年末回升」误读成订单增长。
       · ③ 用 TTM 口径；亏损但经营现金流为正（爱旭/达实这类）算通过。
       · 三张表都按 InfoPublDate ≤ 基准日过滤，避免未来函数。
-      · 银行/保险/券商无毛利率、无合同负债语义 → 标「不适用」，不标「否」。
-    财务数据失败时整列留空（不标「否」）；单只无数据标「无数据」。
+      · 银行/保险/券商无毛利率、无合同负债语义 → 三项均标「不适用」，不标「否」。
+    财务数据失败时三列留空（不标「否」）；单只无数据标「无数据」。
+
+CSV（v3.8 起）：
+    只写 12 列：代码、名称、启动日、距启动交易日、启动日量能倍数、
+    启动日涨幅%、距MA20%、距MA60%、毛利率改善、订单增长、
+    经营现金流情况、财务健康提示。三个判断列把「判断：证据」合并到一格；
+    完整字段（净流入、市值、PE/PB、MA20/MA60 数值等）只保留在 result JSON。
 
 财务健康提示（v3.2，只提示，不参与裁决）：
-    在「业绩转变」5 列之后再增加 1 列「财务健康提示」，回答
+    在「业绩转变」3 个判断列（判断与证据同格）之后再增加 1 列「财务健康提示」，回答
     「这家公司的财务报表有没有明显的危险信号」。四项：
       ① 现金短债比 = 货币资金 ÷ (短期借款 + 一年内到期的非流动负债)
          <1.0 紧张，<0.5 高危；取最新报告期。
@@ -96,15 +88,16 @@ v3.5 口径收紧（P1/P2）：①市值比分母改用 d* 日流通市值（与
     「受限资金」字段，因此无法真正剔除受限。应收用 BillAccReceivable。
 
 ⚠️ 修改登记规范（2026-10-15 15:47 起）：
-    本程序的每次修改，都必须在 K线选股规则_v3.md 的「十一、版本沿革」表中
+    本程序的每次修改，都必须在 K线选股规则_v3.md 的「十、版本沿革」表中
     登记「修改时间」（精确到分钟）与变更内容。未登记时间的修改视为不合规。
-    最近一次：2026-10-26 15:30（v3.4，三件套得分改为加权分 ①3/②2/③1，满分 6）
-    上一条　：2026-10-26 15:20（v3.3，单季 EPS 同比门槛 40%→30%）
-    上上条　：2026-10-26 15:16（v3.2，新增「财务健康提示」列；只提示，不参与裁决）
-    上上上条：2026-10-26 15:03（v3.1，② 订单代理改用 AdvanceReceipts，规模门槛 3%→2%）
-    更早　　：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
-    　　　　：2026-10-16 09:42（v2.0，文档改名 v1→v2，程序内引用同步；逻辑未变）
-    　　　　：2026-10-16 09:39（v1.3，新增「超级成长基因」标注列）
+    最近一次：2026-10-27 11:42（v3.8，CSV 改为精简 12 列，判断与证据合并到一格；选股与裁决未变）
+    上一条　：2026-10-27 11:26（v3.7，业绩转变改为三项独立判断，删除加权总分与总标签；选股与裁决未变）
+    上上条　：2026-10-27 11:00（v3.6，删除「超级成长基因」标注列及相关代码；选股与裁决未变）
+    上上上条：2026-10-27 09:05（v3.5，口径收紧：市值比分母/S 日复检/真上穿/EnterpriseType 等）
+    更早　　：2026-10-26 15:30（v3.4，三件套得分改为加权分 ①3/②2/③1，满分 6）
+    　　　　：2026-10-26 15:20（v3.3，单季 EPS 同比门槛 40%→30%）
+    　　　　：2026-10-26 15:16（v3.2，新增「财务健康提示」列；只提示，不参与裁决）
+    　　　　：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
     　　　　：2026-10-15 15:49（v1.2，文件头补本条规范）
     　　　　：2026-10-15 15:38（v1.1，补 nf is None 防线 + CROSS_TPL 注释）
 """
@@ -172,23 +165,14 @@ def bar_high(bar):
 #    否则旧 cross_*.json 会被当成当前表达式的结果复用（服务端字段随表达式来去）。
 CROSS_CACHE_VERSION = 2
 
-# ---------------- 成长基因标注（只标注，不参与任何裁决） ----------------
-# 定位：在已选出的股票后面标注「是否具备超级成长股的基因底子」，
-#       供人工精筛参考。**它不筛选、不排序、不影响入选名单**。
-# 三条同时成立才标「是」：
-#   ① 最新单季 EPS 同比增长率 > 30%
-#   ② 过去三年 EPS 年均复合增长率 > 25%
-#   ③ 最新年报 ROE > 17%
-GENE_EPS_Q_YOY_MIN = 30.0    # ① 单季 EPS 同比下限（%）
-GENE_EPS_CAGR3_MIN = 25.0    # ② 三年 EPS CAGR 下限（%）
-GENE_ROE_MIN = 17.0          # ③ 最新年报 ROE 下限（%）
-GENE_EPS_CAGR_YEARS = 3      # ② 复合增长年数：最近年报 Y 对比 Y−3
-GENE_FIN_PERIODS = 20        # data_finance 拉取期数（5 年，够算 3 年 CAGR）
-GENE_FIN_BATCH = 10          # data_finance 单批股票数
+# ---------------- 财务数据取数（供业绩转变标注） ----------------
+FIN_PERIODS = 20             # data_finance 拉取期数（5 年）
+FIN_BATCH = 10               # data_finance 单批股票数（利润表）
 
 # ---------------- 业绩转变标注（只标注，不参与任何裁决） ----------------
-# 定位：在「超级成长基因」之后再加一组列，回答「有没有出现业绩拐点」，
-#       同样**不筛选、不排序、不影响入选名单**。三条同时成立才标「是」：
+# 定位：在基础行情列之后再加三组「判断 + 证据」列，回答「有没有出现业绩拐点」。
+#       三个指标**各自独立判断**，不合计总分、不合成「是/部分/否」总标签，
+#       同样**不筛选、不排序、不影响入选名单**：
 #   ① 单季毛利率最近 2 个季度严格递增（GM[t-1] < GM[t]）
 #      + 最新一季营收环比不为负 + 最新单季高于上年同季
 #   ② 合同负债+预收款项 同比 ≥20%，且 ÷ 营业总收入TTM ≥2%
@@ -197,14 +181,8 @@ TURN_GM_REQUIRE_YOY = True   # ① 同比护栏：最新单季毛利率须高于
 TURN_CL_YOY_MIN = 20.0       # ② 订单代理同比下限（%）
 TURN_CL_REV_MIN = 2.0        # ② 订单代理 / 营业总收入TTM 下限（%）
 TURN_OCF_NP_MIN = 1.0        # ③ 经营现金流TTM / 归母净利润TTM 下限
-# 三件套加权分：① 方向最强、② 持续性次之、③ 现金证伪最后。
-# 分值只用于排序/分诊，不改变「三条全过才是是」的判定。
-TURN_SCORE_GM = 3
-TURN_SCORE_CL = 2
-TURN_SCORE_OCF = 1
-TURN_SCORE_MAX = TURN_SCORE_GM + TURN_SCORE_CL + TURN_SCORE_OCF
 TURN_FIN_PERIODS = 20        # data_finance 拉取期数（5 年，足够看 2 季 + 同比）
-TURN_FIN_BATCH = 5           # 限频明显：单批 5 只，比基因的 10 只更稳
+TURN_FIN_BATCH = 5           # 限频明显：单批 5 只，比利润表的 10 只更稳
 TURN_FIN_SLEEP = 2.5         # 批间休眠（秒）
 TURN_FIN_RETRIES = 6         # 单批重试次数
 TURN_FIN_BACKOFF = 15.0      # 限频退避（秒）；普通失败按 3s×次数退避
@@ -231,14 +209,18 @@ CROSS_TPL = ("intersect([ChangePCT >= {lo}, ChangePCT <= {hi}, MainNetFlow > 0, 
 NEW_LABELS = ["listeddate_5days", "listeddate_3mons",
               "listeddate_1year", "listeddate_3year"]
 
-CSV_HEADER = ["基准交易日", "序号", "代码", "名称", "启动日", "距启动交易日",
-              "启动日量能倍数", "启动日涨幅%", "启动日净流入(万元)",
-              "5日净流入(万元)", "净流入占流通市值%", "收盘价",
-              "距MA20%", "距MA60%", "MA20", "MA60", "MA20÷MA60",
-              "流通市值(亿)", "总市值(亿)", "PE", "PB", "换手率%",
-              "超级成长基因",
-              "业绩转变", "三件套得分",
-              "毛利率递增", "订单代理", "经营现金流", "财务健康提示"]
+CSV_HEADER = ["代码", "名称", "启动日", "距启动交易日",
+              "启动日量能倍数", "启动日涨幅%", "距MA20%", "距MA60%",
+              "毛利率改善", "订单增长", "经营现金流情况", "财务健康提示"]
+
+
+def turn_cell(label, desc):
+    """把独立判断与证据拼成一格：是/否/无数据 + 全角冒号 + 证据。"""
+    if not label:
+        return ""
+    if not desc or label == "不适用":
+        return label
+    return f"{label}：{desc}"
 
 
 # ---------------- 基础工具 ----------------
@@ -611,7 +593,7 @@ def get_mv(day, refresh):
     return out
 
 
-# ---------------- 成长基因标注（独立于上面的裁决） ----------------
+# ---------------- 财务数据取数（供业绩转变标注） ----------------
 
 def _westock_module():
     """把 westock CLI 当模块加载，复用它已有的鉴权 / JSON-RPC。
@@ -633,8 +615,9 @@ def _westock_module():
 def get_finance(codes, day, refresh):
     """拉取候选股的利润表核心字段，按基准日缓存。
 
+    供「业绩转变」标注的营收/成本差分兜底使用。
     返回 ({code: [rows]}, 失败代码列表)。rows 是 data_finance 的原始报告期记录，
-    含 BasicEPS / ROE / ROEWeighted / EndDate / InfoPublDate。
+    含 OperatingRevenue / OperatingCost / EndDate / InfoPublDate。
     """
     path = os.path.join(DB, f"finance_{day}.json")
     cached = {} if refresh else jload(path, {})
@@ -647,12 +630,12 @@ def get_finance(codes, day, refresh):
     except Exception as e:
         sys.stderr.write(f"  [失败] 加载 westock 模块：{e}\n")
         return cached, list(codes)
-    for i in range(0, len(todo), GENE_FIN_BATCH):
-        ch = todo[i:i + GENE_FIN_BATCH]
+    for i in range(0, len(todo), FIN_BATCH):
+        ch = todo[i:i + FIN_BATCH]
         d = retry(lambda: wk.call("data_finance", {
             "codes": ",".join(ch), "fields": "core",
-            "num": GENE_FIN_PERIODS, "type": "income"}),
-            what=f"财务数据 第{i // GENE_FIN_BATCH + 1}批")
+            "num": FIN_PERIODS, "type": "income"}),
+            what=f"财务数据 第{i // FIN_BATCH + 1}批")
         if d is None:
             failed.extend(ch)
             continue
@@ -764,116 +747,6 @@ def _end_date(r):
     """报告期 EndDate → 'YYYY-MM-DD'。"""
     v = r.get("EndDate") if isinstance(r, dict) else None
     return str(v)[:10] if v else None
-
-
-def _diff(a, b):
-    return a - b if a is not None and b is not None else None
-
-
-def gene_metrics(rows, day):
-    """按基准日已披露的报告期，计算三条基因指标。
-
-    ⚠️ 必须按 InfoPublDate ≤ day 过滤：data_finance 返回的是「今天能看到的全部
-    报告期」，若不做点位过滤，回测历史日期时会用上当时尚未披露的财报。
-    """
-    rows = [r for r in rows
-            if _pub_date(r.get("InfoPublDate")) and _pub_date(r.get("EndDate"))
-            and _pub_date(r.get("InfoPublDate")) <= day]
-    by = {_pub_date(r["EndDate"]): r for r in rows}
-    if not by:
-        return None      # 基准日前没有已披露财报 → 调用方标「无数据」
-
-    latest = max(by)
-    y, m = int(latest[:4]), int(latest[5:7])
-
-    def cum(dt):
-        r = by.get(dt)
-        return fnum(r.get("BasicEPS")) if r else None
-
-    # 单季 EPS = 本期累计 − 上一期累计；Q1 本身就是单季
-    if m == 3:
-        cur_q, prev_q = cum(latest), cum(f"{y-1}-03-31")
-    elif m == 6:
-        cur_q = _diff(cum(latest), cum(f"{y}-03-31"))
-        prev_q = _diff(cum(f"{y-1}-06-30"), cum(f"{y-1}-03-31"))
-    elif m == 9:
-        cur_q = _diff(cum(latest), cum(f"{y}-06-30"))
-        prev_q = _diff(cum(f"{y-1}-09-30"), cum(f"{y-1}-06-30"))
-    elif m == 12:
-        cur_q = _diff(cum(latest), cum(f"{y}-09-30"))
-        prev_q = _diff(cum(f"{y-1}-12-31"), cum(f"{y-1}-09-30"))
-    else:
-        cur_q = prev_q = None
-
-    eps_yoy = None
-    if cur_q is not None and prev_q is not None and prev_q > 0:
-        eps_yoy = (cur_q / prev_q - 1) * 100
-
-    # 年报序列：最近年报 Y 与 Y−3 的 EPS 算三年 CAGR
-    annuals = sorted(
-        ((int(dt[:4]), fnum(r.get("BasicEPS")),
-          fnum(r.get("ROEWeighted")), fnum(r.get("ROE")))
-         for dt, r in by.items() if dt.endswith("-12-31")),
-        reverse=True)
-    roe = None
-    annual_y = eps_annual = base_y = eps_base = cagr = None
-    if annuals:
-        annual_y, eps_annual, roe_w, roe_raw = annuals[0]
-        roe = roe_w if roe_w is not None else roe_raw
-        base_y = annual_y - GENE_EPS_CAGR_YEARS
-        base = next((x for x in annuals if x[0] == base_y), None)
-        if base:
-            eps_base = base[1]
-            if eps_annual is not None and eps_base is not None \
-                    and eps_annual > 0 and eps_base > 0:
-                cagr = ((eps_annual / eps_base) ** (1.0 / GENE_EPS_CAGR_YEARS) - 1) * 100
-
-    reasons = []
-    if eps_yoy is None:
-        reasons.append("单季EPS同比不可用（基期EPS≤0或数据缺失）")
-    elif eps_yoy <= GENE_EPS_Q_YOY_MIN:
-        reasons.append(f"单季EPS同比 {eps_yoy:.2f}% ≤ {GENE_EPS_Q_YOY_MIN:g}%")
-    if cagr is None:
-        reasons.append("三年EPS CAGR不可用（两期EPS须>0）")
-    elif cagr <= GENE_EPS_CAGR3_MIN:
-        reasons.append(f"三年EPS CAGR {cagr:.2f}% ≤ {GENE_EPS_CAGR3_MIN:g}%")
-    if roe is None:
-        reasons.append("最新年报ROE缺失")
-    elif roe <= GENE_ROE_MIN:
-        reasons.append(f"最新年报ROE {roe:.2f}% ≤ {GENE_ROE_MIN:g}%")
-
-    return {"gene": not reasons,
-            "reason": "；".join(reasons) if reasons else "",
-            "latest_report": latest,
-            "eps_q": round(cur_q, 4) if cur_q is not None else None,
-            "eps_q_prev": round(prev_q, 4) if prev_q is not None else None,
-            "eps_q_yoy": round(eps_yoy, 2) if eps_yoy is not None else None,
-            "annual_y": annual_y, "eps_annual": eps_annual,
-            "base_y": base_y, "eps_base": eps_base,
-            "eps_cagr3": round(cagr, 2) if cagr is not None else None,
-            "roe": round(roe, 2) if roe is not None else None}
-
-
-def compute_gene(codes, day, refresh):
-    """返回 ({code: metrics}, 失败代码列表)；全部失败返回 (None, codes)。
-
-    单只股票没有财务数据不算「整体失败」：该股标「无数据」，不影响其他股票。
-    """
-    if not codes:
-        return {}, []
-    rows_by, failed = get_finance(codes, day, refresh)
-    if not rows_by:
-        return None, failed
-    info = {}
-    for c in codes:
-        rows = rows_by.get(c)
-        if not rows:
-            continue
-        g = gene_metrics(rows, day)
-        if g is None:
-            continue      # 只有基准日之后的财报 → 「无数据」，不是「否」
-        info[c] = g
-    return info, failed
 
 
 # ---------------- 业绩转变标注（只标注，不参与任何裁决） ----------------
@@ -1073,9 +946,9 @@ def health_metrics(inc_rows, bal_rows, ratio_rows, day):
 
 
 def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
-    """按基准日已披露的报表，计算「业绩转变」三件套。
+    """按基准日已披露的报表，计算「业绩转变」三个独立指标。
 
-    ⚠️ 与基因标注一样，必须按 InfoPublDate ≤ day 过滤，避免未来函数。
+    ⚠️ 必须按 InfoPublDate ≤ day 过滤，避免未来函数。
     返回 None 表示三张表在基准日前都没有可用报告期（→「无数据」）。
     """
     def pit(rows):
@@ -1183,29 +1056,37 @@ def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
     if not gm_applicable:
         why1 = "① 无毛利率数据"
         gm_desc = "无毛利率数据"
+        p1_label = "无数据"
     elif g2 is None or g3 is None:
         why1 = "① 近2季单季毛利率数据不足"
         gm_desc = f"{gm_text}；数据不足（需最近2个单季）"
+        p1_label = "无数据"
     else:
         if not gm_ok:
             why1 = "① 近2季毛利率未环比改善"
             state = "环比未改善"
+            p1_label = "否"
         elif not rev_ok:
             if r2 is None or r3 is None:
                 why1 = "① 营收环比数据不足"
                 state = "毛利率改善但营收环比数据不足"
+                p1_label = "无数据"
             else:
                 why1 = "① 毛利率改善但营收环比不达标"
                 state = "毛利率改善但营收环比不达标"
+                p1_label = "否"
         elif TURN_GM_REQUIRE_YOY and gm_yoy is None:
             why1 = "① 上年同季毛利率缺失，无法确认同比"
             state = "毛利率与营收达标，但同比不可比"
+            p1_label = "无数据"
         elif TURN_GM_REQUIRE_YOY and not gm_yoy_ok:
             why1 = "① 最新单季毛利率未高于上年同季"
             state = "毛利率与营收达标，但未高于上年同季"
+            p1_label = "否"
         else:
             why1 = ""
             state = "环比改善"
+            p1_label = "是"
         if gm_yoy is None:
             yoy_txt = "同比 无数据"
         else:
@@ -1235,16 +1116,22 @@ def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
           and cl_ratio is not None and cl_ratio >= TURN_CL_REV_MIN)
     if not cl_applicable:
         why2 = "② 无合同负债/预收数据"
+        p2_label = "无数据"
     elif cl_growth is None:
         why2 = "② 上年同期订单代理缺失或为0"
+        p2_label = "无数据"
     elif cl_growth < TURN_CL_YOY_MIN:
         why2 = f"② 订单同比 {cl_growth:.1f}% < {TURN_CL_YOY_MIN:g}%"
+        p2_label = "否"
     elif cl_ratio is None:
         why2 = "② 营业总收入TTM缺失"
+        p2_label = "无数据"
     elif cl_ratio < TURN_CL_REV_MIN:
         why2 = f"② 订单/营收 {cl_ratio:.1f}% < {TURN_CL_REV_MIN:g}%"
+        p2_label = "否"
     else:
         why2 = ""
+        p2_label = "是"
 
     if not cl_applicable:
         cl_desc = "无合同负债/预收数据"
@@ -1274,16 +1161,22 @@ def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
                or (ratio is not None and ratio >= TURN_OCF_NP_MIN)))
     if ocf is None:
         why3 = "③ 经营现金流TTM缺失"
+        p3_label = "无数据"
     elif ocf <= 0:
         why3 = f"③ 经营现金流TTM {ocf / 1e8:.1f}亿 ≤ 0"
+        p3_label = "否"
     elif turn_pos:
         why3 = ""
+        p3_label = "是"
     elif np_ is None:
         why3 = "③ 归母净利润TTM缺失"
+        p3_label = "无数据"
     elif np_ > 0 and (ratio is None or ratio < TURN_OCF_NP_MIN):
         why3 = f"③ 现金流/净利润 {ratio:.2f} < {TURN_OCF_NP_MIN:g}"
+        p3_label = "否"
     else:
         why3 = ""
+        p3_label = "是"
 
     if ocf is None or np_ is None:
         ocf_np_text = ""
@@ -1311,48 +1204,21 @@ def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
 
     health = health_metrics(inc_rows, bal_rows, ratio_rows, day)
 
-    # 银行/保险/券商：没有毛利率、也没有合同负债语义 → 整体「不适用」。
+    # 银行/保险/券商：没有毛利率、也没有合同负债语义 → 三项均「不适用」。
     # v3.5：不再用「字段缺失」反推行业（那会把恰好缺字段的普通制造业误标成金融），
     # 改用接口自带的 EnterpriseType（实测 balance / balancesheet 均返回，income 没有）。
-    # 非金融企业若两个字段都缺 → 记「数据缺失」，与「不适用」区分开。
     ent = next((r.get("EnterpriseType") for r in bal.values()
                 if r.get("EnterpriseType")), None)
     is_financial = bool(ent) and ent != "一般企业"
-    applicable = gm_applicable or cl_applicable
-    if not applicable and not is_financial:
-        return {"label": "数据缺失", "score": None, "applicable": False,
-                "reason": "；".join(x for x in (why1, why2, why3) if x),
-                "period": t, "gm_text": gm_text, "gm": [g2, g3],
-                "gm_yoy": gm_yoy, "gm_desc": gm_desc,
-                "rev_q": [r2, r3], "rev_ok": bool(rev_ok),
-                "cl_growth": cl_growth, "cl_ratio": cl_ratio,
-                "cl_part": cl_part, "ar_part": ar_part, "cl_desc": cl_desc,
-                "ocf_np_text": ocf_np_text, "ocf_desc": ocf_desc,
-                "ocf_ttm": ocf, "np_ttm": np_, "ocf_prev": ocf_prev,
-                "health": health, "health_label": "数据不足",
-                "health_desc": "毛利率/合同负债字段缺失，四项指标无法判定",
-                "enterprise_type": ent, "p1": False, "p2": False, "p3": False}
-    if not applicable:      # 金融行业：语义上不适用，不是数据问题
-        return {"label": "不适用", "score": None, "applicable": False,
-                "reason": "；".join(x for x in (why1, why2, why3) if x),
-                "period": t, "gm_text": gm_text, "gm": [g2, g3],
-                "gm_yoy": gm_yoy, "gm_desc": gm_desc,
-                "rev_q": [r2, r3], "rev_ok": bool(rev_ok),
-                "cl_growth": cl_growth, "cl_ratio": cl_ratio,
-                "cl_part": cl_part, "ar_part": ar_part, "cl_desc": cl_desc,
-                "ocf_np_text": ocf_np_text, "ocf_desc": ocf_desc,
-                "ocf_ttm": ocf, "np_ttm": np_, "ocf_prev": ocf_prev,
-                "health": health, "health_label": "不适用",
-                "health_desc": f"金融行业（{ent}），四项指标不适用",
-                "enterprise_type": ent, "p1": False, "p2": False, "p3": False}
+    health_label = health["level"]
+    health_desc = health["desc"]
+    if is_financial:
+        p1_label = p2_label = p3_label = "不适用"
+        health_label = "不适用"
+        health_desc = f"金融行业（{ent}），四项指标不适用"
 
-    score = ((TURN_SCORE_GM if p1 else 0) +
-             (TURN_SCORE_CL if p2 else 0) +
-             (TURN_SCORE_OCF if p3 else 0))
-    label = "是" if (p1 and p2 and p3) else ("部分" if score else "否")
     reasons = [x for x in (why1, why2, why3) if x]
-    return {"label": label, "score": score, "applicable": True,
-            "reason": "；".join(reasons),
+    return {"reason": "；".join(reasons),
             "period": t,
             "gm": [g2, g3], "gm_text": gm_text, "gm_desc": gm_desc,
             "gm_yoy": round(gm_yoy, 2) if gm_yoy is not None else None,
@@ -1364,10 +1230,11 @@ def turnaround_metrics(inc_rows, bal_rows, ratio_rows, day):
             "ocf_ttm": ocf, "np_ttm": np_, "ocf_prev": ocf_prev,
             "ocf_np": round(ratio, 3) if ratio is not None else None,
             "ocf_np_text": ocf_np_text, "ocf_desc": ocf_desc,
-            "health": health, "health_label": health["level"],
-            "health_desc": health["desc"],
+            "health": health, "health_label": health_label,
+            "health_desc": health_desc,
             "enterprise_type": ent,
-            "p1": bool(p1), "p2": bool(p2), "p3": bool(p3)}
+            "p1": bool(p1), "p2": bool(p2), "p3": bool(p3),
+            "p1_label": p1_label, "p2_label": p2_label, "p3_label": p3_label}
 
 
 def compute_turnaround(codes, day, refresh):
@@ -1501,7 +1368,7 @@ def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
 # ---------------- 主流程 ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description="K线选股规则 v3.5（每周选股，K=5）")
+    ap = argparse.ArgumentParser(description="K线选股规则 v3.8（每周选股，K=5）")
     ap.add_argument("--date", help="基准交易日（默认最近交易日）")
     ap.add_argument("--n", type=int, default=4,
                     help="新鲜度窗口，必须 = 扫描周期−1（每周 K=5 用 4=默认；"
@@ -1707,31 +1574,6 @@ def main():
     for k, v in rej2.items():
         rej[k] = rej.get(k, 0) + v
 
-    # ---- 超级成长基因标注（只标注，不影响上面任何裁决结果）----
-    gene, gene_failed = compute_gene([x["code"] for x in final], S, a.refresh)
-    if gene is None:
-        # 财务数据是**附加标注**，不该因为它失败就让整周选股作废；
-        # 但也绝不能静默标成「否」——那会被误读为「已确认没有基因」。
-        print("      ⚠️ 财务数据获取失败：「超级成长基因」列留空（选股结果不受影响）",
-              file=sys.stderr)
-    elif gene_failed:
-        print(f"      ⚠️ {len(gene_failed)} 只财务数据缺失，标「无数据」："
-              f"{', '.join(gene_failed[:8])}{'…' if len(gene_failed) > 8 else ''}",
-              file=sys.stderr)
-    for x in final:
-        if gene is None:
-            x["gene"] = ""
-            x["gene_detail"] = None
-            continue
-        g = gene.get(x["code"])
-        x["gene"] = ("是" if g["gene"] else "否") if g else "无数据"
-        x["gene_detail"] = g
-    if gene is not None and final:
-        n_yes = sum(1 for x in final if x["gene"] == "是")
-        n_no = sum(1 for x in final if x["gene"] == "否")
-        n_na = sum(1 for x in final if x["gene"] == "无数据")
-        print(f"      基因标注：是 {n_yes} 只 ｜ 否 {n_no} 只 ｜ 无数据 {n_na} 只")
-
     # ---- 业绩转变标注（只标注，不影响上面任何裁决结果）----
     turn, turn_failed = compute_turnaround(
         [x["code"] for x in final], S, a.refresh)
@@ -1744,21 +1586,23 @@ def main():
               file=sys.stderr)
     for x in final:
         if turn is None:
-            x.update({"turn_label": "", "turn_score": "", "turn_detail": None,
+            x.update({"turn_p1": "", "turn_p2": "", "turn_p3": "",
+                      "turn_detail": None,
                       "turn_gm": "", "turn_cl": "", "turn_ocf": "",
                       "health_label": "", "health_desc": "",
                       "health_detail": None})
             continue
         m = turn.get(x["code"])
         if m is None:
-            x.update({"turn_label": "无数据", "turn_score": "",
-                      "turn_detail": None, "turn_gm": "",
-                      "turn_cl": "", "turn_ocf": "",
+            x.update({"turn_p1": "无数据", "turn_p2": "无数据",
+                      "turn_p3": "无数据", "turn_detail": None,
+                      "turn_gm": "", "turn_cl": "", "turn_ocf": "",
                       "health_label": "数据不足",
                       "health_desc": "财务数据缺失", "health_detail": None})
             continue
-        x["turn_label"] = m["label"]
-        x["turn_score"] = m["score"] if m["score"] is not None else ""
+        x["turn_p1"] = m["p1_label"]
+        x["turn_p2"] = m["p2_label"]
+        x["turn_p3"] = m["p3_label"]
         x["turn_detail"] = m
         x["turn_gm"] = m.get("gm_desc") or ""
         x["turn_cl"] = m.get("cl_desc") or ""
@@ -1774,13 +1618,16 @@ def main():
         else:
             x["health_text"] = ""
     if turn is not None and final:
-        # v3.5：新增「数据缺失」——与「不适用（金融行业）」区分开
-        order = ["是", "部分", "否", "无数据", "数据缺失", "不适用"]
-        cnt = {k: 0 for k in order}
-        for x in final:
-            cnt[x["turn_label"]] = cnt.get(x["turn_label"], 0) + 1
-        print("      业绩转变：" + " ｜ ".join(
-            f"{k} {cnt[k]} 只" for k in order))
+        order = ["是", "否", "无数据", "不适用"]
+        for key, name in (("turn_p1", "①毛利率环比改善"),
+                          ("turn_p2", "②合同负债/订单增长"),
+                          ("turn_p3", "③经营现金流")):
+            cnt = {}
+            for x in final:
+                v = x.get(key) or "无数据"
+                cnt[v] = cnt.get(v, 0) + 1
+            print(f"      {name}：" + " ｜ ".join(
+                f"{k} {cnt[k]} 只" for k in order if cnt.get(k)))
 
     final.sort(key=lambda x: (x["age"], -x["vcross"]))
 
@@ -1789,24 +1636,19 @@ def main():
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(CSV_HEADER)
-        for n, x in enumerate(final, 1):
+        for x in final:
             w.writerow([
-                S, n, x["code"], x.get("name") or "", x["d_star"], x["age"],
-                round(x["vcross"], 2), x.get("chg"),
-                round(x["net_flow"] / 1e4, 2) if x.get("net_flow") is not None else "",
-                round(x["net_flow_5d"] / 1e4, 2) if x.get("net_flow_5d") is not None else "",
-                x.get("flow_ratio"), x["close"], x["r20"], x["r60"],
-                round(x["ma20"], 4), round(x["ma60"], 4), x["m20_m60"],
-                x.get("float_cap_yi"), x.get("total_cap_yi"),
-                x.get("pe"), x.get("pb"), x.get("turnover"),
-                x.get("gene", ""),
-                x.get("turn_label", ""), x.get("turn_score", ""),
-                x.get("turn_gm", ""), x.get("turn_cl", ""),
-                x.get("turn_ocf", ""), x.get("health_text", ""),
+                x["code"], x.get("name") or "",
+                x["d_star"], x["age"], round(x["vcross"], 2), x.get("chg"),
+                x["r20"], x["r60"],
+                turn_cell(x.get("turn_p1", ""), x.get("turn_gm", "")),
+                turn_cell(x.get("turn_p2", ""), x.get("turn_cl", "")),
+                turn_cell(x.get("turn_p3", ""), x.get("turn_ocf", "")),
+                x.get("health_text", ""),
             ])
 
     # ---- 写运行明细（便于追溯）----
-    result = {"版本": "v3.5",
+    result = {"版本": "v3.8",
               "基准日": S, "扫描周期K": a.n + 1, "新鲜度窗口N": a.n,
               "覆盖区间": need,
               "参数": {"K_VOL": a.k_vol, "涨幅区间": [a.chg_lo, a.chg_hi],
@@ -1817,16 +1659,7 @@ def main():
                                      "（listeddate_5days/3mons/1year/3year）",
                        "市值比分母": "d* 日流通市值（与分子同日）",
                        "市值比分母来源": "mv_<d*>.json（screen condition NegotiableMV）"},
-              "基因标注参数": {"单季EPS同比下限%": GENE_EPS_Q_YOY_MIN,
-                               "三年EPS_CAGR下限%": GENE_EPS_CAGR3_MIN,
-                               "最新年报ROE下限%": GENE_ROE_MIN,
-                               "三年CAGR基期": f"最近年报年−{GENE_EPS_CAGR_YEARS}",
-                               "数据是否可用": gene is not None,
-                               "缺失代码": gene_failed},
-              "业绩转变参数": {"三件套权重": {"①毛利率": TURN_SCORE_GM,
-                                                "②订单": TURN_SCORE_CL,
-                                                "③现金流": TURN_SCORE_OCF},
-                               "三件套满分": TURN_SCORE_MAX,
+              "业绩转变参数": {"判定方式": "三项独立判断，不合计总分",
                                "①毛利率环比季数": 2,
                                "①营收环比不为负": True,
                                "①最新单季毛利率高于上年同季": TURN_GM_REQUIRE_YOY,
@@ -1862,10 +1695,13 @@ def main():
     for k, v in sorted(rej.items(), key=lambda kv: -kv[1]):
         print(f"    {k}: {v}")
     if final:
+        def _mark(v):
+            return {"是": "是", "否": "否", "无数据": "无",
+                    "不适用": "不"}.get(v, "-")
         print(f"\n{'代码':10s}{'名称':9s}{'启动日':12s}{'距启动':>6s}"
               f"{'量能':>7s}{'距MA20':>8s}{'距MA60':>8s}{'市值比':>8s}"
-              f"{'流通市值亿':>11s}{'PE':>10s}{'基因':>7s}"
-              f"{'转变':>7s}{'分':>3s}")
+              f"{'流通市值亿':>11s}{'PE':>10s}"
+              f"{'①':>3s}{'②':>3s}{'③':>3s}")
         for x in final:
             print(f"{x['code']:10s}{(x.get('name') or '')[:8]:9s}"
                   f"{x['d_star']:12s}{x['age']:6d}{x['vcross']:7.2f}"
@@ -1873,9 +1709,9 @@ def main():
                   f"{(x.get('flow_ratio') or 0):7.2f}%"
                   f"{str(x.get('float_cap_yi') or '-'):>11s}"
                   f"{str(x.get('pe') or '-'):>10s}"
-                  f"{str(x.get('gene') or '-'):>7s}"
-                  f"{str(x.get('turn_label') or '-'):>7s}"
-                  f"{str(x.get('turn_score') if x.get('turn_score') != '' else '-'):>3s}")
+                  f"{_mark(x.get('turn_p1')):>3s}"
+                  f"{_mark(x.get('turn_p2')):>3s}"
+                  f"{_mark(x.get('turn_p3')):>3s}")
     print(f"\nCSV    : {csv_path}")
     print(f"明细   : {res_path}")
     print(f"原始数据: {DB}/")
