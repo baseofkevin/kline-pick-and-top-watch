@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-K线选股规则 v3.8 —— 每周选股（扫描周期 K = 5 个交易日）
+K线选股规则 v3.9 —— 每周选股（扫描周期 K = 5 个交易日）
 
 规则说明见同目录 K线选股规则_v3.md
 v2.6 为 P0 工程修复；v2.7 为 P1-A 候选池上下限调整（CHG_LO 2.0→0.5、CHG_HI 9.5→20.5）；
@@ -18,6 +18,10 @@ v3.5 口径收紧（P1/P2）：①市值比分母改用 d* 日流通市值（与
 v3.6 删除「超级成长基因」标注列及相关代码（原第九节）；选股与裁决条件未变。
 v3.7 业绩转变改为三项独立判断，删除加权总分与「是/部分/否」总标签；选股与裁决条件未变。
 v3.8 CSV 改为精简 12 列，三个判断列把「判断：证据」合并到一格；完整数据仍在 result JSON。
+v3.9 剔除过程可审计：新增「剔除统计 / 剔除明细 / 剔除代码 / 剔除阶段」四个字段，
+     顶层统计仍按数字归一化聚合，明细保留真实 age/量能/日期；CSV 与 JSON 改原子写，
+     收尾校验两者存在且行数一致，并把产物写进 result；修「K线历史不足(i根)」少报 1 根；
+     新增「粗筛池 = 入选 + 剔除」与逐股覆盖断言。选股与裁决条件未变。
 
 目录结构：
     /home/kevin/MyData/kline-select-stocks-approach/
@@ -90,11 +94,12 @@ CSV（v3.8 起）：
 ⚠️ 修改登记规范（2026-10-15 15:47 起）：
     本程序的每次修改，都必须在 K线选股规则_v3.md 的「十、版本沿革」表中
     登记「修改时间」（精确到分钟）与变更内容。未登记时间的修改视为不合规。
-    最近一次：2026-10-27 11:42（v3.8，CSV 改为精简 12 列，判断与证据合并到一格；选股与裁决未变）
-    上一条　：2026-10-27 11:26（v3.7，业绩转变改为三项独立判断，删除加权总分与总标签；选股与裁决未变）
-    上上条　：2026-10-27 11:00（v3.6，删除「超级成长基因」标注列及相关代码；选股与裁决未变）
-    上上上条：2026-10-27 09:05（v3.5，口径收紧：市值比分母/S 日复检/真上穿/EnterpriseType 等）
-    更早　　：2026-10-26 15:30（v3.4，三件套得分改为加权分 ①3/②2/③1，满分 6）
+    最近一次：2026-10-30 16:45（v3.9，剔除明细可审计 + 原子写 + 产物校验 + 计数断言；选股与裁决未变）
+    上一条　：2026-10-27 11:42（v3.8，CSV 改为精简 12 列，判断与证据合并到一格；选股与裁决未变）
+    上上条　：2026-10-27 11:26（v3.7，业绩转变改为三项独立判断，删除加权总分与总标签；选股与裁决未变）
+    上上上条：2026-10-27 11:00（v3.6，删除「超级成长基因」标注列及相关代码；选股与裁决未变）
+    更早　　：2026-10-27 09:05（v3.5，口径收紧：市值比分母/S 日复检/真上穿/EnterpriseType 等）
+    　　　　：2026-10-26 15:30（v3.4，三件套得分改为加权分 ①3/②2/③1，满分 6）
     　　　　：2026-10-26 15:20（v3.3，单季 EPS 同比门槛 40%→30%）
     　　　　：2026-10-26 15:16（v3.2，新增「财务健康提示」列；只提示，不参与裁决）
     　　　　：2026-10-23 16:29（v2.5，修复 K 线补取只存 1 根 → 合格股被误判「历史不足」）
@@ -309,8 +314,39 @@ def jload(path, default):
 
 
 def jdump(path, obj):
+    """原子写 JSON：先写同目录 .tmp，fsync 后 os.replace（同盘 rename 是原子的）。
+
+    v3.9：原实现直接 open(path, "w")，进程在 dump 中途被杀会留下半截 JSON，
+    而 jload() 的 `except: return default` 会把半截文件静默当成空缓存——
+    比报错更危险（例如把「当日 0 只」当成真实结果）。改原子写后，要么旧文件、
+    要么完整新文件，不存在第三种状态。
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    json.dump(obj, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, ensure_ascii=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def write_csv_atomic(path, header, rows):
+    """原子写 CSV（同上）。writerows 一次写全，避免逐行 flush 的额外开销。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(header)
+        w.writerows(rows)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def count_csv_rows(path):
+    """数据行数（不含表头）。用于收尾校验 CSV 与名单条数一致。"""
+    with open(path, encoding="utf-8-sig") as fh:
+        return sum(1 for _ in fh) - 1
 
 
 # ---------------- 数据获取（含落盘） ----------------
@@ -1268,7 +1304,8 @@ def find_start(code, name, bars, S):
     if i is None:
         return None, f"K线无 {S} 数据"
     if i < MIN_HISTORY:
-        return None, f"K线历史不足({i}根)"
+        # v3.9：i 是 S 的 0 基下标，bars[:i+1] 实际有 i+1 根；原文案少报 1 根。
+        return None, f"K线历史不足({i + 1}根，需≥{MIN_HISTORY + 1})"
     cl = [x[1] for x in bars]
     vo = [x[2] for x in bars]
     up = 0
@@ -1367,8 +1404,32 @@ def judge(det, bars, S, N, cross_by_day, st_by_day, new_by_day,
 
 # ---------------- 主流程 ----------------
 
+REJ_STAGE = {"FS": "find_start 定位启动日",
+             "JD": "judge 逐条裁决",
+             "MV": "市值比二次过滤"}
+
+
+def reason_cat(why):
+    """把剔除原因归一成**聚合键**：可变数字 → #，固定均线周期放行。
+
+    v3.9：这只用于「剔除统计」的顶层分组（例如把
+    `⑦ 距启动4日 > N=4`/`…5日…`/`…6日…` 合成 `⑦ 距启动#日 > N=#` 一行），
+    **不得**再当作唯一账本。真实参数（N、量能比、age、日期）保留在
+    「剔除明细」的原文键里，逐股对应关系保留在「剔除代码」里。
+    原实现直接拿归一化后的串当唯一键，导致历史 JSON 无法反推当时阈值、
+    也无法回答「某只股票为什么没选上」。
+
+    `MA20`/`MA60` 是写死在 find_start()/judge() 里的固定周期，不是可变参数，
+    一并抹成 `MA#` 只会让统计表读不出是哪条均线（如「未站上 MA#」），
+    因此放行 `MA\\d+`；其余数字仍归一（`N=4`、`1.20<1.75`、`0.2%` 等确实会变）。
+    """
+    return re.sub(r"MA\d+|[\d.]+",
+                  lambda m: m.group(0) if m.group(0).startswith("MA") else "#",
+                  why)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="K线选股规则 v3.8（每周选股，K=5）")
+    ap = argparse.ArgumentParser(description="K线选股规则 v3.9（每周选股，K=5）")
     ap.add_argument("--date", help="基准交易日（默认最近交易日）")
     ap.add_argument("--n", type=int, default=4,
                     help="新鲜度窗口，必须 = 扫描周期−1（每周 K=5 用 4=默认；"
@@ -1478,13 +1539,17 @@ def main():
               f"{', '.join(km_missing[:8])}{'…' if len(km_missing) > 8 else ''}")
 
     print("[5/6] 逐条裁决 ...", flush=True)
-    hit, rej = [], {}
+    hit = []
+    rej_raw = {}     # v3.9 原文原因 -> 次数（保留真实 N/age/量能比/日期）
+    rej_code = {}    # v3.9 code -> [阶段码, 原文原因]，逐股可追溯
+    rej = {}         # 顶层统计：reason_cat(原文) -> 次数（仅供展示与跨批对比）
     for c in pool:
         name = next((cross_by_day[d][c].get("name") for d in need
                      if c in cross_by_day[d]), "")
         det, why0 = find_start(c, name, km.get(c, []), S)
         if det is None:
-            rej[why0] = rej.get(why0, 0) + 1
+            rej_raw[why0] = rej_raw.get(why0, 0) + 1
+            rej_code[c] = ["FS", why0]
             continue
         ok, why = judge(det, km[c], S, a.n, cross_by_day, st_by_day, new_by_day,
                         a.k_vol, a.ma60_gap, C2_TOL, C3_RATIO,
@@ -1492,8 +1557,8 @@ def main():
         if ok:
             hit.append(det)
         else:
-            k = re.sub(r"[\d.]+", "#", why)      # 归一化，便于统计
-            rej[k] = rej.get(k, 0) + 1
+            rej_raw[why] = rej_raw.get(why, 0) + 1
+            rej_code[c] = ["JD", why]
 
     print("[6/6] 取行情 / 计算市值比 / 写结果 ...", flush=True)
     q = get_quotes([x["code"] for x in hit], S, a.refresh) if hit else {}
@@ -1554,8 +1619,9 @@ def main():
         tc = float(pair[1]) if pair[1] else None
         ratio = nf / fc * 100 if (nf is not None and fc) else None
         if a.flow_ratio > 0 and (ratio is None or ratio < a.flow_ratio):
-            rej2[f"③ 启动日市值比 < {a.flow_ratio}%"] = \
-                rej2.get(f"③ 启动日市值比 < {a.flow_ratio}%", 0) + 1
+            why2 = f"③ 启动日市值比 < {a.flow_ratio}%"
+            rej2[why2] = rej2.get(why2, 0) + 1
+            rej_code[x["code"]] = ["MV", why2]
             continue
         x.update({
             "chg": chg, "net_flow": nf, "net_flow_5d": nf5,
@@ -1572,7 +1638,28 @@ def main():
         })
         final.append(x)
     for k, v in rej2.items():
-        rej[k] = rej.get(k, 0) + v
+        rej_raw[k] = rej_raw.get(k, 0) + v
+
+    # v3.9：顶层统计由「原文 -> 次数」聚合得到，原文与逐股映射另行落盘。
+    for why, n in rej_raw.items():
+        k = reason_cat(why)
+        rej[k] = rej.get(k, 0) + n
+
+    # v3.9 计数断言：pool 里每只股票有且只有一种去向（入选 / 某一阶段被剔）。
+    # 放在 rej2 合并之后，否则会漏算「市值比」那几只。
+    n_rej = sum(rej_raw.values())
+    final_codes = {x["code"] for x in final}
+    if len(pool) != len(final) + n_rej:
+        raise RuntimeError(
+            f"计数不自洽：粗筛池 {len(pool)} ≠ 入选 {len(final)} + 剔除 {n_rej}")
+    if set(rej_code) & final_codes:
+        raise RuntimeError(
+            f"同一只股票既入选又被剔除：{sorted(set(rej_code) & final_codes)[:5]}")
+    if set(rej_code) | final_codes != set(pool):
+        miss = sorted(set(pool) - (set(rej_code) | final_codes))
+        extra = sorted((set(rej_code) | final_codes) - set(pool))
+        raise RuntimeError(
+            f"逐股去向不完整：池中无去向 {miss[:5]}；池外多出 {extra[:5]}")
 
     # ---- 业绩转变标注（只标注，不影响上面任何裁决结果）----
     turn, turn_failed = compute_turnaround(
@@ -1631,24 +1718,28 @@ def main():
 
     final.sort(key=lambda x: (x["age"], -x["vcross"]))
 
-    # ---- 写 CSV ----
+    # ---- 写 CSV（v3.9 原子写 + 行数校验）----
     csv_path = os.path.join(CSVDIR, f"选股_{S}.csv")
-    with open(csv_path, "w", encoding="utf-8-sig", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(CSV_HEADER)
-        for x in final:
-            w.writerow([
-                x["code"], x.get("name") or "",
-                x["d_star"], x["age"], round(x["vcross"], 2), x.get("chg"),
-                x["r20"], x["r60"],
-                turn_cell(x.get("turn_p1", ""), x.get("turn_gm", "")),
-                turn_cell(x.get("turn_p2", ""), x.get("turn_cl", "")),
-                turn_cell(x.get("turn_p3", ""), x.get("turn_ocf", "")),
-                x.get("health_text", ""),
-            ])
+    res_path = os.path.join(DB, f"result_{S}.json")
+    csv_rows = [[
+        x["code"], x.get("name") or "",
+        x["d_star"], x["age"], round(x["vcross"], 2), x.get("chg"),
+        x["r20"], x["r60"],
+        turn_cell(x.get("turn_p1", ""), x.get("turn_gm", "")),
+        turn_cell(x.get("turn_p2", ""), x.get("turn_cl", "")),
+        turn_cell(x.get("turn_p3", ""), x.get("turn_ocf", "")),
+        x.get("health_text", ""),
+    ] for x in final]
+    write_csv_atomic(csv_path, CSV_HEADER, csv_rows)
+    n_csv = count_csv_rows(csv_path)
+    if n_csv != len(final):
+        raise RuntimeError(
+            f"CSV 行数 {n_csv} ≠ 名单 {len(final)}：写盘后立即校验失败，"
+            f"不写 result JSON（{csv_path}）")
 
     # ---- 写运行明细（便于追溯）----
-    result = {"版本": "v3.8",
+    stats = dict(sorted(rej.items(), key=lambda kv: -kv[1]))
+    result = {"版本": "v3.9",
               "基准日": S, "扫描周期K": a.n + 1, "新鲜度窗口N": a.n,
               "覆盖区间": need,
               "参数": {"K_VOL": a.k_vol, "涨幅区间": [a.chg_lo, a.chg_hi],
@@ -1684,14 +1775,33 @@ def main():
                   "应收口径": "BillAccReceivable",
                   "短期有息负债口径": "ShortTermLoan + NonCurrentLiabilityIn1Year"},
               "粗筛池": len(pool), "入选数": len(final),
-              "剔除非": dict(sorted(rej.items(), key=lambda kv: -kv[1])),
+              # v3.9：剔除非（兼容旧字段）/ 剔除统计 为同一份归一化聚合
+              "剔除非": stats,
+              "剔除统计": stats,
+              "剔除明细": dict(sorted(rej_raw.items(), key=lambda kv: -kv[1])),
+              "剔除代码": rej_code,
+              "剔除阶段": REJ_STAGE,
+              "剔除口径": ("统计=数字归一化聚合（仅用于分组展示）；"
+                           "明细=原文，保留真实 N/量能比/age/日期；"
+                           "代码=逐股去向 [阶段码, 原因]"),
+              "产物": {"csv": os.path.basename(csv_path), "csv行数": n_csv,
+                       "json": os.path.basename(res_path)},
               "名单": final}
-    res_path = os.path.join(DB, f"result_{S}.json")
     jdump(res_path, result)
+
+    # v3.9：收尾成对校验。CSV 先写、JSON 后写，正常结束必须两者都在且行数一致；
+    # 任何一半缺失都说明产物被外部改动或写盘异常，不能静默返回 0。
+    if not os.path.exists(csv_path) or not os.path.exists(res_path):
+        raise RuntimeError(
+            f"产物缺失：CSV {'有' if os.path.exists(csv_path) else '无'} / "
+            f"JSON {'有' if os.path.exists(res_path) else '无'}")
+    if count_csv_rows(csv_path) != len(final):
+        raise RuntimeError(
+            f"产物行数不一致：CSV {count_csv_rows(csv_path)} ≠ 名单 {len(final)}")
 
     # ---- 打印 ----
     print(f"\n粗筛池 {len(pool)} 只 → 入选 {len(final)} 只\n")
-    print("剔除明细：")
+    print("剔除明细（按原因聚合；逐股原因见 result JSON 的「剔除代码」）：")
     for k, v in sorted(rej.items(), key=lambda kv: -kv[1]):
         print(f"    {k}: {v}")
     if final:
